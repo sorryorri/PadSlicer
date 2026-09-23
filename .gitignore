@@ -1,0 +1,13 @@
+# Build output (recreated by CMake)
+build/
+build-*/
+cmake-build-*/
+
+# Packaged releases (attach these to a GitHub release instead)
+dist/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+*.xcodeproj/
