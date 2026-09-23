@@ -445,7 +445,8 @@ void ChipButton::paintButton (juce::Graphics& g, bool isHighlighted, bool)
                 g.drawRect (bounds, 1.0f);
             }
 
-            drawPixelText (g, getButtonText(), bounds, 1, selected ? Palette::lcdBackground : colour);
+            drawPixelText (g, getButtonText(), bounds.reduced (3.0f, 0.0f), bounds.getHeight() >= 18.0f ? 2 : 1,
+                           selected ? Palette::lcdBackground : colour);
             break;
         }
 

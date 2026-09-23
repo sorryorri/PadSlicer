@@ -29,6 +29,7 @@ namespace
     const juce::Identifier slotsTag ("SLOTS"), slotTag ("SLOT"), settingsTag ("SETTINGS"), settingTag ("S");
     const juce::Identifier uiScaleProperty ("uiScale");
     const juce::Identifier controlProperties[] = { "start", "pitch", "speed", "cutoff", "volume" };
+    const juce::Identifier generatorTag ("GEN");
 }
 
 //==============================================================================
@@ -361,6 +362,9 @@ void PadSlicerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const int numSamples = buffer.getNumSamples();
     buffer.clear();
 
+    lastBpm = getHostBpm();
+    addPreviewNotes (midiMessages, numSamples);
+
     // Merge in pads clicked in the editor, and track held notes for the pad lights
     keyboardState.processNextMidiBuffer (midiMessages, 0, numSamples, true);
 
@@ -467,6 +471,77 @@ void PadSlicerAudioProcessor::processEffects (juce::AudioBuffer<float>& buffer, 
     plate.setParameters (value (plateParams, 0), percent (plateParams, 1), value (plateParams, 2));
     plate.setMix (isOn (plateParams) ? percent (plateParams, 3) : 0.0f);
     plate.process (buffer, numSamples);
+}
+
+void PadSlicerAudioProcessor::setPreviewPattern (const Generator::Pattern& pattern)
+{
+    auto newPattern = std::make_unique<Generator::Pattern> (pattern);
+
+    {
+        const juce::SpinLock::ScopedLockType lock (patternLock);
+        std::swap (previewPattern, newPattern);
+    }
+
+    // the old pattern is freed here, off the audio thread
+}
+
+void PadSlicerAudioProcessor::addPreviewNotes (juce::MidiBuffer& midi, int numSamples)
+{
+    if (! previewOn.load())
+    {
+        if (previewWasOn)
+        {
+            midi.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+            previewWasOn = false;
+        }
+
+        return;
+    }
+
+    const juce::SpinLock::ScopedTryLockType lock (patternLock);
+
+    if (! lock.isLocked() || previewPattern == nullptr || previewPattern->lengthBeats <= 0.0)
+        return;
+
+    const auto& pattern = *previewPattern;
+    const double beatsPerSample = lastBpm.load() / 60.0 / currentSampleRate;
+
+    if (! previewWasOn)
+    {
+        previewWasOn = true;
+        previewBeat = 0.0;
+    }
+
+    // While the host plays, line the preview up with its bars; otherwise run a clock of our own
+    double start = previewBeat;
+
+    if (auto* playHead = getPlayHead())
+        if (auto position = playHead->getPosition())
+            if (position->getIsPlaying())
+                if (auto ppq = position->getPpqPosition())
+                    start = *ppq;
+
+    const double end = start + numSamples * beatsPerSample;
+    const double length = pattern.lengthBeats;
+
+    // Adds an event if its time (repeating every pattern length) falls inside this block
+    auto addIfInBlock = [&] (double beat, const juce::MidiMessage& message)
+    {
+        const double time = beat + std::ceil ((start - beat) / length) * length;
+
+        if (time < end)
+            midi.addEvent (message, juce::jlimit (0, numSamples - 1, (int) ((time - start) / beatsPerSample)));
+    };
+
+    // Note-offs first, so a note ending exactly where the next one starts doesn't cut it off
+    for (const auto& note : pattern.notes)
+        addIfInBlock (std::fmod (note.start + note.length, length), juce::MidiMessage::noteOff (1, note.note));
+
+    for (const auto& note : pattern.notes)
+        addIfInBlock (note.start, juce::MidiMessage::noteOn (1, note.note, note.velocity));
+
+    previewBeat = end;
+    previewPosition = std::fmod (juce::jmax (0.0, end), length);
 }
 
 double PadSlicerAudioProcessor::getHostBpm() const
@@ -783,11 +858,14 @@ void PadSlicerAudioProcessor::startLoad (int slot, const SlotInfo& info, std::fu
 
             auto hits = sample->hits;
 
+            const double rate = sample->sampleRate;
+
             if (swapSample (slot, sample, generation) && slot == sliceSlot)
             {
                 const juce::ScopedLock lock (infoLock);
                 uiHits = std::move (hits);
                 uiSliceLength = length;
+                uiSliceRate = rate;
             }
         }
         else if (loadGenerations[(size_t) slot] == generation)
@@ -866,6 +944,7 @@ PadSlicerAudioProcessor::SliceLayout PadSlicerAudioProcessor::getSliceLayout() c
         const juce::ScopedLock lock (infoLock);
         hits = uiHits;
         layout.length = uiSliceLength;
+        layout.sampleRate = uiSliceRate;
     }
 
     const auto sliceBy = getSliceBy();
@@ -1062,6 +1141,14 @@ void PadSlicerAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 
     state.appendChild (settingsTree, nullptr);
 
+    juce::ValueTree generatorTree (generatorTag);
+    generatorTree.setProperty ("seed", generatorSettings.seed, nullptr);
+
+    for (int c = 0; c < Generator::numControls; ++c)
+        generatorTree.setProperty (juce::String ("c") + juce::String (c), generatorSettings.values[(size_t) c], nullptr);
+
+    state.appendChild (generatorTree, nullptr);
+
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -1124,9 +1211,21 @@ void PadSlicerAudioProcessor::setStateInformation (const void* data, int sizeInB
 
     uiScale = (float) state.getProperty (uiScaleProperty, 1.0f);
 
+    generatorSettings = {};
+
+    if (auto generatorTree = state.getChildWithName (generatorTag); generatorTree.isValid())
+    {
+        generatorSettings.seed = (juce::int64) generatorTree.getProperty ("seed", 0);
+
+        for (int c = 0; c < Generator::numControls; ++c)
+            generatorSettings.values[(size_t) c] = (float) generatorTree.getProperty (juce::String ("c") + juce::String (c),
+                                                                                       Generator::getControlInfo (c).defaultValue);
+    }
+
     // Keep only the parameters in the APVTS state
     state.removeChild (state.getChildWithName (slotsTag), nullptr);
     state.removeChild (state.getChildWithName (settingsTag), nullptr);
+    state.removeChild (state.getChildWithName (generatorTag), nullptr);
     state.removeProperty (uiScaleProperty, nullptr);
     state.removeProperty ("samplePath", nullptr);
 

@@ -83,6 +83,73 @@ private:
 };
 
 //==============================================================================
+// A handle you drag out of the plugin and onto a DAW track to drop the pattern in as a MIDI clip.
+class MidiDragButton final : public juce::Component
+{
+public:
+    MidiDragButton();
+
+    // Writes the MIDI file to drag; returns an invalid File if there's nothing to drag
+    std::function<juce::File()> createFile;
+
+    void paint (juce::Graphics&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseEnter (const juce::MouseEvent&) override   { repaint(); }
+    void mouseExit (const juce::MouseEvent&) override    { repaint(); }
+
+private:
+    bool dragging = false;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiDragButton)
+};
+
+//==============================================================================
+// The GEN page: makes MIDI patterns for the slices or pads, previews them and hands them to the DAW.
+class GenPanel final : public juce::Component
+{
+public:
+    explicit GenPanel (PadSlicerAudioProcessor&);
+
+    void paint (juce::Graphics&) override;
+    void resized() override;
+
+    // Called regularly while the page is showing: keeps the pattern in step with the slices or pads
+    void update();
+
+    std::function<void (const juce::String&)> onStatus;
+
+private:
+    struct MiniKnob
+    {
+        juce::Slider slider;
+        juce::Label label;
+    };
+
+    std::vector<Generator::Source> collectSources (double& loopBeats) const;
+    void generateNew();
+    void regenerate();
+    juce::String getClipName() const;
+    juce::File writeMidiFile (const juce::File& file) const;
+    void saveMidiFile();
+
+    PadSlicerAudioProcessor& processorRef;
+
+    Retro::ChipButton generateChip { "GENERATE", Retro::ChipButton::Style::lcd };
+    Retro::ChipButton playChip { "PLAY", Retro::ChipButton::Style::lcd };
+    Retro::ChipButton saveChip { "SAVE", Retro::ChipButton::Style::lcd };
+    MidiDragButton dragButton;
+    std::array<MiniKnob, Generator::numControls> knobs;
+    std::unique_ptr<juce::FileChooser> chooser;
+
+    Generator::Pattern pattern;
+    juce::String sourcesKey;
+    juce::Rectangle<int> patternArea;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GenPanel)
+};
+
+//==============================================================================
 // The whole interface, laid out at a fixed design size. The editor scales it.
 class PadSlicerUI final : public juce::Component,
                           public juce::FileDragAndDropTarget,
@@ -104,7 +171,10 @@ public:
     void resized() override;
 
     void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp (const juce::MouseEvent&) override;
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
+    void mouseMagnify (const juce::MouseEvent&, float scaleFactor) override;
 
     bool isInterestedInFileDrag (const juce::StringArray& files) override;
     void filesDropped (const juce::StringArray& files, int x, int y) override;
@@ -119,7 +189,7 @@ private:
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
     };
 
-    enum class Page { slicer, pads, fx };
+    enum class Page { slicer, pads, fx, gen };
 
     void timerCallback() override;
 
@@ -151,7 +221,16 @@ private:
 
     juce::Rectangle<float> waveformArea() const;
     juce::Rectangle<float> markStripArea() const;
+    juce::Rectangle<float> overviewArea() const;
     int sliceAt (float x, const Processor::SliceLayout&) const;
+
+    // Zooming the slicer's view of the loop. Positions are fractions of the loop's length.
+    double positionAt (float x) const;
+    float xForPosition (double position) const;
+    void zoomAround (double anchor, double factor);
+    void scrollView (double amount);
+    void showWholeLoop();
+    bool canZoom() const;
     bool isNoteLit (int note) const;
 
     Processor& processorRef;
@@ -163,14 +242,17 @@ private:
     Retro::ArcadeButton transferButton { "TRANSFER", Retro::Palette::mint };
     Retro::ArcadeButton loadButton    { "LOAD", Retro::Palette::gold };
     Retro::ArcadeButton triggerButton { "TRIG", Retro::Palette::coral };
-    Retro::TabButton slicerTab { "SLICER" }, padsTab { "PADS" }, fxTab { "FX" };
+    Retro::TabButton slicerTab { "SLICER" }, padsTab { "PADS" }, fxTab { "FX" }, genTab { "GEN" };
     Retro::ChipButton gridChip { "GRID", Retro::ChipButton::Style::lcd }, hitsChip { "HITS", Retro::ChipButton::Style::lcd };
+    Retro::ChipButton zoomOutChip { "-", Retro::ChipButton::Style::lcd }, zoomInChip { "+", Retro::ChipButton::Style::lcd },
+                      zoomAllChip { "ALL", Retro::ChipButton::Style::lcd };
     Retro::ChipButton slotChip { "", Retro::ChipButton::Style::panel }, masterChip { "MASTER", Retro::ChipButton::Style::panel };
     Retro::ChipButton sizeChip { "", Retro::ChipButton::Style::menu };
     std::unique_ptr<juce::FileChooser> chooser;
 
     PadGrid padGrid;
     FxPanel fxPanel;
+    GenPanel genPanel;
     std::array<Knob, 6> knobs;
 
     // Layout
@@ -191,6 +273,10 @@ private:
     double levelUpTime = -1.0e9;
     juce::String statusMessage { "READY." };
     double statusTime = 0.0;
+
+    // The part of the loop the slicer shows
+    double viewStart = 0.0, viewEnd = 1.0;
+    bool draggingOverview = false;
 
     // What the knobs are currently connected to
     bool editMaster = false;

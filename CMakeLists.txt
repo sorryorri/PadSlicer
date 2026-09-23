@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0")
 
-project(PADSLICER VERSION 0.1.0)
+project(PADSLICER VERSION 0.2.0)
 
 # Pull JUCE in at configure time. To use a local checkout instead, configure with
 # -DFETCHCONTENT_SOURCE_DIR_JUCE=/path/to/JUCE
@@ -39,7 +39,8 @@ target_sources(PadSlicer
         Retro.cpp
         Knight.cpp
         Effects.cpp
-        Transients.cpp)
+        Transients.cpp
+        Generator.cpp)
 
 target_compile_definitions(PadSlicer
     PUBLIC

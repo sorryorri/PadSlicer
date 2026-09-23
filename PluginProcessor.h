@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "Effects.h"
+#include "Generator.h"
 #include "KnightProgress.h"
 
 //==============================================================================
@@ -133,6 +134,7 @@ public:
     {
         std::vector<juce::Range<int>> slices;
         int length = 0;
+        double sampleRate = 44100.0;
     };
 
     SliceLayout getSliceLayout() const;
@@ -151,6 +153,16 @@ public:
     float takeOutputPeak()            { return outputPeak.exchange (0.0f); }
     double getHostSampleRate() const  { return currentSampleRate; }
     KnightProgress& getKnightProgress() { return knightProgress; }
+
+    //==============================================================================
+    // Pattern generator (GEN page). Settings are only touched on the message thread.
+    Generator::Settings generatorSettings;
+
+    // Plays a generated pattern through the plugin, following the host's position while it plays
+    void setPreviewPattern (const Generator::Pattern&);
+    std::atomic<bool> previewOn { false };
+    double getPreviewPosition() const { return previewPosition.load(); }
+    double getLastBpm() const         { return lastBpm.load(); }
 
     // Editor state that should survive closing the window
     std::atomic<int> selectedSlice { 0 }, selectedPad { 0 };
@@ -203,6 +215,7 @@ private:
     void releaseAllVoices();
     void renderVoices (juce::AudioBuffer<float>&, int startSample, int numSamples);
     void processEffects (juce::AudioBuffer<float>&, int numSamples);
+    void addPreviewNotes (juce::MidiBuffer&, int numSamples);
     double getHostBpm() const;
 
     juce::AudioFormatManager formatManager;
@@ -215,6 +228,7 @@ private:
     std::array<SlotInfo, numSlots> slotInfos;    // guarded by infoLock
     std::vector<int> uiHits;                     // guarded by infoLock
     int uiSliceLength = 0;                       // guarded by infoLock
+    double uiSliceRate = 44100.0;                // guarded by infoLock
     juce::CriticalSection infoLock;
 
     // Bumped for every new request, so a slow old load can never overwrite a newer one
@@ -240,6 +254,13 @@ private:
     std::atomic<float> outputPeak { 0.0f };
 
     KnightProgress knightProgress;
+
+    std::unique_ptr<Generator::Pattern> previewPattern;   // guarded by patternLock
+    juce::SpinLock patternLock;
+    double previewBeat = 0.0;
+    bool previewWasOn = false;
+    std::atomic<double> previewPosition { 0.0 };
+    std::atomic<double> lastBpm { 120.0 };
 
     std::atomic<float>* modeParam     = nullptr;
     std::atomic<float>* triggerParam  = nullptr;

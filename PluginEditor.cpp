@@ -36,7 +36,7 @@ namespace
     constexpr double statusMs = 4000.0;
     constexpr double levelUpMs = 2600.0;
 
-    constexpr int tabWidth = 100;
+    constexpr int tabWidth = 80;
     constexpr int tabHeight = 26;
 
     constexpr std::array<float, 5> uiSizes { 0.75f, 1.0f, 1.25f, 1.5f, 2.0f };
@@ -384,11 +384,398 @@ void FxPanel::updateEnabledStates()
 }
 
 //==============================================================================
+MidiDragButton::MidiDragButton()
+{
+    setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+}
+
+void MidiDragButton::paint (juce::Graphics& g)
+{
+    const auto bounds = getLocalBounds().toFloat();
+    const auto colour = ! isEnabled() ? Palette::lcdDim : (isMouseOver() || dragging ? Palette::lcdBright : Palette::lcdMid);
+
+    // A dashed outline says "drag me"
+    g.setColour (colour);
+
+    for (float x = bounds.getX(); x < bounds.getRight(); x += 6.0f)
+    {
+        g.fillRect (x, bounds.getY(), 3.0f, 1.0f);
+        g.fillRect (x, bounds.getBottom() - 1.0f, 3.0f, 1.0f);
+    }
+
+    for (float y = bounds.getY(); y < bounds.getBottom(); y += 6.0f)
+    {
+        g.fillRect (bounds.getX(), y, 1.0f, 3.0f);
+        g.fillRect (bounds.getRight() - 1.0f, y, 1.0f, 3.0f);
+    }
+
+    auto textArea = bounds.reduced (5.0f, 0.0f);
+    drawPixelText (g, ">", textArea.removeFromRight (12.0f), 2, colour);
+    drawPixelText (g, "DRAG TO DAW", textArea, 2, colour);
+}
+
+void MidiDragButton::mouseDrag (const juce::MouseEvent& e)
+{
+    if (dragging || ! isEnabled() || e.getDistanceFromDragStart() < 4 || createFile == nullptr)
+        return;
+
+    const auto file = createFile();
+
+    if (! file.existsAsFile())
+        return;
+
+    dragging = true;
+    repaint();
+
+    juce::Component::SafePointer<MidiDragButton> safeThis (this);
+
+    juce::DragAndDropContainer::performExternalDragDropOfFiles ({ file.getFullPathName() }, false, this, [safeThis]
+    {
+        if (safeThis != nullptr)
+        {
+            safeThis->dragging = false;
+            safeThis->repaint();
+        }
+    });
+}
+
+void MidiDragButton::mouseUp (const juce::MouseEvent&)
+{
+    dragging = false;
+    repaint();
+}
+
+//==============================================================================
+GenPanel::GenPanel (Processor& p)
+    : processorRef (p)
+{
+    generateChip.onClick = [this] { generateNew(); };
+    saveChip.onClick = [this] { saveMidiFile(); };
+
+    playChip.onClick = [this]
+    {
+        if (pattern.notes.empty())
+            generateNew();
+
+        processorRef.previewOn = ! processorRef.previewOn.load() && ! pattern.notes.empty();
+
+        if (onStatus != nullptr)
+            onStatus (processorRef.previewOn ? "PREVIEW PLAYING" : "PREVIEW STOPPED");
+    };
+
+    dragButton.createFile = [this]
+    {
+        auto folder = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("PadSlicer MIDI");
+        folder.createDirectory();
+        const auto file = writeMidiFile (folder.getChildFile (getClipName() + ".mid"));
+
+        if (onStatus != nullptr && file.existsAsFile())
+            onStatus ("DROP IT ON A MIDI TRACK");
+
+        return file;
+    };
+
+    for (juce::Component* child : std::initializer_list<juce::Component*> { &generateChip, &playChip, &saveChip, &dragButton })
+        addAndMakeVisible (child);
+
+    for (int c = 0; c < Generator::numControls; ++c)
+    {
+        auto& knob = knobs[(size_t) c];
+        const auto& info = Generator::getControlInfo (c);
+
+        // Small amber knobs that look like part of the screen
+        knob.slider.getProperties().set ("pixelCell", 3.0f);
+        knob.slider.getProperties().set ("pixelSize", 1);
+        knob.slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        knob.slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 64, 12);
+        knob.slider.setColour (juce::Slider::thumbColourId, Palette::lcdBright);
+        knob.slider.setColour (juce::Slider::textBoxTextColourId, Palette::lcdBright);
+        knob.slider.setRange (info.min, info.max, 1.0);
+        knob.slider.textFromValueFunction = [c] (double value) { return Generator::getValueText (c, (float) value); };
+        knob.slider.valueFromTextFunction = [] (const juce::String& text) { return text.getDoubleValue(); };
+        knob.slider.setDoubleClickReturnValue (true, info.defaultValue);
+        knob.slider.setValue (processorRef.generatorSettings.values[(size_t) c], juce::dontSendNotification);
+        knob.slider.updateText();
+
+        // Turning a knob reshapes the current pattern; only GENERATE rolls a new one
+        knob.slider.onValueChange = [this, c, &knob]
+        {
+            processorRef.generatorSettings.values[(size_t) c] = (float) knob.slider.getValue();
+            regenerate();
+        };
+
+        addAndMakeVisible (knob.slider);
+
+        knob.label.setText (info.name, juce::dontSendNotification);
+        knob.label.setJustificationType (juce::Justification::centred);
+        knob.label.setColour (juce::Label::textColourId, Palette::lcdMid);
+        knob.label.getProperties().set ("pixelSize", 1);
+        addAndMakeVisible (knob.label);
+    }
+}
+
+void GenPanel::resized()
+{
+    auto area = getLocalBounds();
+
+    auto top = area.removeFromTop (20);
+    generateChip.setBounds (top.removeFromLeft (112));
+    top.removeFromLeft (6);
+    playChip.setBounds (top.removeFromLeft (60));
+    top.removeFromLeft (6);
+    dragButton.setBounds (top.removeFromLeft (156));
+    top.removeFromLeft (6);
+    saveChip.setBounds (top.removeFromLeft (60));
+
+    area.removeFromTop (6);
+    patternArea = area.removeFromLeft (236);
+    area.removeFromLeft (8);
+
+    // Two rows of five knobs
+    const int knobWidth = area.getWidth() / 5;
+    const int knobHeight = area.getHeight() / 2;
+
+    for (int c = 0; c < Generator::numControls; ++c)
+    {
+        auto cell = juce::Rectangle<int> (area.getX() + (c % 5) * knobWidth, area.getY() + (c / 5) * knobHeight,
+                                          knobWidth, knobHeight);
+        auto& knob = knobs[(size_t) c];
+        knob.label.setBounds (cell.removeFromTop (10));
+        knob.slider.setBounds (cell);
+    }
+}
+
+void GenPanel::paint (juce::Graphics& g)
+{
+    const auto info = pattern.notes.empty()
+                        ? juce::String()
+                        : Generator::getValueText (Generator::bars, processorRef.generatorSettings.values[Generator::bars])
+                              + "  " + juce::String ((int) pattern.notes.size()) + " NOTES";
+
+    drawPixelText (g, info, juce::Rectangle<float> ((float) saveChip.getRight() + 8.0f, 0.0f,
+                                                    (float) (getWidth() - saveChip.getRight() - 8), 20.0f),
+                   1, Palette::lcdMid, juce::Justification::centredRight);
+
+    // Pattern view: one row per slice or pad used, lowest at the bottom
+    const auto area = patternArea.toFloat();
+    g.setColour (Palette::lcdDim);
+    g.drawRect (area, 1.0f);
+
+    if (pattern.notes.empty())
+    {
+        drawPixelText (g, sourcesKey.endsWith (":") ? "LOAD A LOOP OR PADS" : "PRESS GENERATE", area.reduced (6.0f), 1, Palette::lcdMid);
+        return;
+    }
+
+    const auto inner = area.reduced (3.0f);
+    const double length = pattern.lengthBeats;
+
+    std::vector<int> rows;
+
+    for (const auto& note : pattern.notes)
+        if (std::find (rows.begin(), rows.end(), note.note) == rows.end())
+            rows.push_back (note.note);
+
+    std::sort (rows.begin(), rows.end());
+    const float rowHeight = inner.getHeight() / (float) rows.size();
+
+    // Beat and bar lines
+    for (int beat = 1; beat < (int) length; ++beat)
+    {
+        g.setColour (beat % 4 == 0 ? Palette::lcdMid.withAlpha (0.8f) : Palette::lcdDim.withAlpha (0.6f));
+        g.fillRect (std::round (inner.getX() + inner.getWidth() * (float) (beat / length)), inner.getY(), 1.0f, inner.getHeight());
+    }
+
+    for (const auto& note : pattern.notes)
+    {
+        const auto row = (float) (std::find (rows.begin(), rows.end(), note.note) - rows.begin());
+        const float gap = rowHeight > 4.0f ? 1.0f : 0.0f;
+        const float x = inner.getX() + inner.getWidth() * (float) (note.start / length);
+        const float width = juce::jmax (2.0f, inner.getWidth() * (float) (note.length / length));
+
+        g.setColour (Palette::lcdBright.withAlpha (0.45f + 0.55f * note.velocity));
+        g.fillRect (juce::Rectangle<float> (x, inner.getBottom() - (row + 1.0f) * rowHeight + gap,
+                                            width, juce::jmax (1.5f, rowHeight - 2.0f * gap)));
+    }
+
+    // Playhead while previewing
+    if (processorRef.previewOn.load())
+    {
+        const float x = inner.getX() + inner.getWidth() * (float) (processorRef.getPreviewPosition() / length);
+        g.setColour (Palette::lcdBright);
+        g.fillRect (std::round (x), area.getY(), 2.0f, area.getHeight());
+    }
+}
+
+std::vector<Generator::Source> GenPanel::collectSources (double& loopBeats) const
+{
+    std::vector<Generator::Source> sources;
+    loopBeats = 4.0;
+
+    // Kit mode plays the loaded pads
+    if (processorRef.getMode() == Processor::Mode::kit)
+    {
+        std::vector<int> loaded;
+
+        for (int pad = 0; pad < Processor::numPads; ++pad)
+            if (! processorRef.getSlotInfo (pad).isEmpty())
+                loaded.push_back (pad);
+
+        for (size_t i = 0; i < loaded.size(); ++i)
+            sources.push_back ({ Processor::firstNote + loaded[i], (double) i / (double) loaded.size() });
+
+        return sources;
+    }
+
+    // Slice mode plays the slices; only the ticked ones if any are ticked
+    const auto layout = processorRef.getSliceLayout();
+
+    if (layout.length <= 0 || layout.slices.empty())
+        return sources;
+
+    // How many beats the loop lasts at the current tempo, rounded to a musical length
+    const double beats = layout.length / layout.sampleRate * processorRef.getLastBpm() / 60.0;
+
+    if (beats > 0.0)
+        for (const double candidate : { 1.0, 2.0, 4.0, 8.0, 16.0, 32.0 })
+            if (std::abs (std::log2 (candidate / beats)) < std::abs (std::log2 (loopBeats / beats)))
+                loopBeats = candidate;
+
+    bool anyTicked = false;
+
+    for (size_t i = 0; i < layout.slices.size(); ++i)
+        anyTicked = anyTicked || processorRef.markedSlices[i];
+
+    for (size_t i = 0; i < layout.slices.size(); ++i)
+        if (! anyTicked || processorRef.markedSlices[i])
+            sources.push_back ({ Processor::firstNote + (int) i, (double) layout.slices[i].getStart() / layout.length });
+
+    return sources;
+}
+
+void GenPanel::update()
+{
+    // Rebuild the pattern when the slices or pads it plays change
+    double loopBeats = 4.0;
+    const auto sources = collectSources (loopBeats);
+
+    juce::String key;
+    key << loopBeats << ":";
+
+    for (const auto& source : sources)
+        key << source.note << ",";
+
+    if (key != sourcesKey)
+    {
+        sourcesKey = key;
+        regenerate();
+    }
+
+    // The settings can also change from outside (loading a set)
+    for (int c = 0; c < Generator::numControls; ++c)
+    {
+        auto& slider = knobs[(size_t) c].slider;
+        const float value = processorRef.generatorSettings.values[(size_t) c];
+
+        if (! slider.isMouseButtonDown() && ! juce::approximatelyEqual ((float) slider.getValue(), value))
+            slider.setValue (value, juce::dontSendNotification);
+    }
+
+    const bool playing = processorRef.previewOn.load();
+    playChip.setButtonText (playing ? "STOP" : "PLAY");
+    playChip.setToggleState (playing, juce::dontSendNotification);
+    dragButton.setEnabled (! pattern.notes.empty());
+    saveChip.setEnabled (! pattern.notes.empty());
+}
+
+void GenPanel::generateNew()
+{
+    double loopBeats = 4.0;
+
+    if (collectSources (loopBeats).empty())
+    {
+        if (onStatus != nullptr)
+            onStatus (processorRef.getMode() == Processor::Mode::kit ? "LOAD SOME PADS FIRST" : "LOAD A LOOP FIRST");
+
+        return;
+    }
+
+    processorRef.generatorSettings.seed = juce::Random::getSystemRandom().nextInt64() | 1;
+    regenerate();
+
+    if (onStatus != nullptr)
+        onStatus ("NEW PATTERN: " + juce::String ((int) pattern.notes.size()) + " NOTES");
+}
+
+void GenPanel::regenerate()
+{
+    double loopBeats = 4.0;
+    const auto sources = collectSources (loopBeats);
+
+    pattern = Generator::generate (processorRef.generatorSettings, sources, loopBeats);
+    processorRef.setPreviewPattern (pattern);
+
+    if (pattern.notes.empty())
+        processorRef.previewOn = false;
+
+    repaint();
+}
+
+juce::String GenPanel::getClipName() const
+{
+    const auto id = juce::String::toHexString (processorRef.generatorSettings.seed).getLastCharacters (4).toUpperCase();
+    return "PadSlicer " + id;
+}
+
+juce::File GenPanel::writeMidiFile (const juce::File& file) const
+{
+    if (pattern.notes.empty())
+        return {};
+
+    file.deleteFile();
+    juce::FileOutputStream out (file);
+
+    if (! out.openedOk())
+        return {};
+
+    Generator::toMidiFile (pattern).writeTo (out);
+    out.flush();
+    return file;
+}
+
+void GenPanel::saveMidiFile()
+{
+    if (pattern.notes.empty())
+        return;
+
+    chooser = std::make_unique<juce::FileChooser> ("Save MIDI clip",
+                                                   juce::File::getSpecialLocation (juce::File::userDesktopDirectory)
+                                                       .getChildFile (getClipName() + ".mid"),
+                                                   "*.mid");
+
+    juce::Component::SafePointer<GenPanel> safeThis (this);
+
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+                              | juce::FileBrowserComponent::warnAboutOverwriting,
+                          [safeThis] (const juce::FileChooser& fc)
+                          {
+                              if (safeThis == nullptr || fc.getResult() == juce::File())
+                                  return;
+
+                              const auto file = safeThis->writeMidiFile (fc.getResult().withFileExtension (".mid"));
+
+                              if (safeThis->onStatus != nullptr)
+                                  safeThis->onStatus (file.existsAsFile() ? "SAVED " + file.getFileName() : juce::String ("COULDN'T SAVE THE FILE"));
+                          });
+}
+
+//==============================================================================
 PadSlicerUI::PadSlicerUI (Processor& p)
     : processorRef (p),
-      thumbnail (512, p.getFormatManager(), thumbnailCache),
+      thumbnail (16, p.getFormatManager(), thumbnailCache),
       padGrid (p),
-      fxPanel (p.apvts)
+      fxPanel (p.apvts),
+      genPanel (p)
 {
     setLookAndFeel (&lookAndFeel);
     setOpaque (true);
@@ -399,14 +786,19 @@ PadSlicerUI::PadSlicerUI (Processor& p)
     slicerTab.onClick     = [this] { setPage (Page::slicer); };
     padsTab.onClick       = [this] { setPage (Page::pads); };
     fxTab.onClick         = [this] { setPage (Page::fx); };
+    genTab.onClick        = [this] { setPage (Page::gen); };
     gridChip.onClick      = [this] { setChoice (processorRef, Processor::sliceById, 0); };
     hitsChip.onClick      = [this] { setChoice (processorRef, Processor::sliceById, 1); };
+    zoomOutChip.onClick   = [this] { zoomAround ((viewStart + viewEnd) * 0.5, 0.5); };
+    zoomInChip.onClick    = [this] { zoomAround ((viewStart + viewEnd) * 0.5, 2.0); };
+    zoomAllChip.onClick   = [this] { showWholeLoop(); };
     slotChip.onClick      = [this] { editMaster = false; bindKnobs(); };
     masterChip.onClick    = [this] { editMaster = true; bindKnobs(); };
     sizeChip.onClick      = [this] { showSizeMenu(); };
 
     for (juce::Button* button : std::initializer_list<juce::Button*> { &transferButton, &loadButton, &triggerButton,
-                                                                       &slicerTab, &padsTab, &fxTab, &gridChip, &hitsChip,
+                                                                       &slicerTab, &padsTab, &fxTab, &genTab, &gridChip, &hitsChip,
+                                                                       &zoomOutChip, &zoomInChip, &zoomAllChip,
                                                                        &slotChip, &masterChip, &sizeChip })
         addAndMakeVisible (button);
 
@@ -414,6 +806,9 @@ PadSlicerUI::PadSlicerUI (Processor& p)
     padGrid.onPadSelected = [this] { editMaster = false; bindKnobs(); };
     addChildComponent (padGrid);
     addChildComponent (fxPanel);
+
+    genPanel.onStatus = [this] (const juce::String& message) { setStatus (message); };
+    addChildComponent (genPanel);
 
     struct KnobSpec { const char* name; const char* suffix; juce::Colour colour; };
     const std::array<KnobSpec, 6> specs { { { "SLICES", "",    Palette::gold   },
@@ -456,6 +851,9 @@ PadSlicerUI::~PadSlicerUI()
 {
     stopTimer();
 
+    // Closing the window stops the pattern preview
+    processorRef.previewOn = false;
+
     for (auto& knob : knobs)
         knob.attachment.reset();
 
@@ -481,11 +879,17 @@ void PadSlicerUI::resized()
     lcdContentArea = lcdArea.reduced (10).withTrimmedTop (24);
     padGrid.setBounds (lcdContentArea);
     fxPanel.setBounds (lcdContentArea);
+    genPanel.setBounds (lcdContentArea);
 
     // GRID / HITS switch in the screen header, after the page name
     const auto header = lcdArea.reduced (10).withHeight (16);
     gridChip.setBounds (header.getX() + 82, header.getY() + 1, 34, 14);
     hitsChip.setBounds (gridChip.getRight() + 4, gridChip.getY(), 34, 14);
+
+    // Zoom buttons just left of TRIG/GATE
+    zoomAllChip.setBounds (header.getRight() - 56 - 30, gridChip.getY(), 30, 14);
+    zoomInChip.setBounds (zoomAllChip.getX() - 20, gridChip.getY(), 16, 14);
+    zoomOutChip.setBounds (zoomInChip.getX() - 20, gridChip.getY(), 16, 14);
 
     meterArea = knobRow.removeFromRight (64);
     knobRow.removeFromRight (12);
@@ -506,6 +910,7 @@ void PadSlicerUI::resized()
     slicerTab.setBounds (bezelArea.getX() + 14, bezelArea.getY() - tabHeight, tabWidth, tabHeight);
     padsTab.setBounds (slicerTab.getRight() + 4, slicerTab.getY(), tabWidth, tabHeight);
     fxTab.setBounds (padsTab.getRight() + 4, slicerTab.getY(), tabWidth, tabHeight);
+    genTab.setBounds (fxTab.getRight() + 4, slicerTab.getY(), tabWidth, tabHeight);
 
     sizeChip.setBounds (statusArea.withTrimmedLeft (statusArea.getWidth() - 146).reduced (3));
 
@@ -571,7 +976,7 @@ void PadSlicerUI::renderBackground (float scale)
     const auto bezel = bezelArea.toFloat();
     g.setColour (Palette::bezel);
 
-    for (float x = (float) fxTab.getRight() + 16.0f; x + 16.0f <= bezel.getRight() - 14.0f; x += 32.0f)
+    for (float x = (float) genTab.getRight() + 16.0f; x + 16.0f <= bezel.getRight() - 14.0f; x += 32.0f)
         g.fillRect (x, bezel.getY() - 8.0f, 16.0f, 10.0f);
 
     g.fillRoundedRectangle (bezel, 10.0f);
@@ -598,6 +1003,11 @@ void PadSlicerUI::renderBackground (float scale)
     g.fillRoundedRectangle (status.translated (0.0f, 2.0f), 4.0f);
     g.setColour (Palette::statusBar);
     g.fillRoundedRectangle (status, 4.0f);
+
+    // Credits, in small print under the status bar
+    drawPixelText (g, "BY SORRYORRI & FRANKO",
+                   juce::Rectangle<float> (status.getX(), status.getBottom() + 5.0f, status.getWidth(), 8.0f), 1,
+                   Palette::ice.withAlpha (0.5f), juce::Justification::centred);
 }
 
 //==============================================================================
@@ -729,7 +1139,7 @@ void PadSlicerUI::drawLcd (juce::Graphics& g)
     auto lcd = lcdArea.toFloat().reduced (10.0f);
     const auto header = lcd.removeFromTop (16.0f);
 
-    const auto pageName = page == Page::fx ? "FX" : (page == Page::pads ? "PADS" : "SLICER");
+    const auto pageName = page == Page::gen ? "GEN" : (page == Page::fx ? "FX" : (page == Page::pads ? "PADS" : "SLICER"));
     drawPixelText (g, pageName, header, 2, Palette::lcdBright, juce::Justification::centredLeft);
     drawPixelText (g, processorRef.getTrigger() == Processor::Trigger::oneShot ? "TRIG" : "GATE",
                    header, 2, Palette::lcdBright, juce::Justification::centredRight);
@@ -741,6 +1151,10 @@ void PadSlicerUI::drawLcd (juce::Graphics& g)
     {
         centreText = "SIGNAL FLOW >";
     }
+    else if (page == Page::gen)
+    {
+        centreText = processorRef.getMode() == Processor::Mode::kit ? "PATTERN FOR PADS" : "PATTERN FOR SLICES";
+    }
     else if (page == Page::pads)
     {
         centreText = "16 PADS";
@@ -748,15 +1162,30 @@ void PadSlicerUI::drawLcd (juce::Graphics& g)
     else
     {
         centreText = shownFile == juce::File() ? juce::String ("NO SAMPLE") : shownFile.getFileName();
-        centreArea = header.withTrimmedLeft (170.0f).withTrimmedRight (60.0f);
+        centreArea = header.withTrimmedLeft (170.0f).withTrimmedRight (144.0f);
     }
 
     drawPixelText (g, centreText, centreArea, 2, Palette::lcdMid);
 
-    g.setColour (Palette::lcdDim);
+    if (page == Page::slicer && viewEnd - viewStart < 0.999)
+    {
+        // Overview bar: the bright part is the section of the loop on screen. Drag it to move around.
+        const auto overview = overviewArea();
+        const float x0 = overview.getX() + overview.getWidth() * (float) viewStart;
+        const float x1 = overview.getX() + overview.getWidth() * (float) viewEnd;
 
-    for (float x = header.getX(); x < header.getRight(); x += 4.0f)
-        g.fillRect (x, header.getBottom() + 3.0f, 2.0f, 2.0f);
+        g.setColour (Palette::lcdDim);
+        g.fillRect (juce::Rectangle<float> (overview.getX(), overview.getY() + 3.0f, overview.getWidth(), 2.0f).toNearestInt());
+        g.setColour (Palette::lcdBright);
+        g.fillRect (juce::Rectangle<float> (x0, overview.getY() + 1.0f, juce::jmax (4.0f, x1 - x0), 6.0f).toNearestInt());
+    }
+    else
+    {
+        g.setColour (Palette::lcdDim);
+
+        for (float x = header.getX(); x < header.getRight(); x += 4.0f)
+            g.fillRect (x, header.getBottom() + 3.0f, 2.0f, 2.0f);
+    }
 
     if (page == Page::slicer)
         drawWaveform (g, lcdContentArea.toFloat());
@@ -767,6 +1196,65 @@ juce::Rectangle<float> PadSlicerUI::waveformArea() const
     return lcdContentArea.toFloat().withTrimmedTop (12.0f).withTrimmedBottom (18.0f);
 }
 
+juce::Rectangle<float> PadSlicerUI::overviewArea() const
+{
+    const auto header = lcdArea.toFloat().reduced (10.0f).withHeight (16.0f);
+    return { header.getX(), header.getBottom(), header.getWidth(), 8.0f };
+}
+
+double PadSlicerUI::positionAt (float x) const
+{
+    const auto wave = waveformArea();
+    return viewStart + (double) ((x - wave.getX()) / wave.getWidth()) * (viewEnd - viewStart);
+}
+
+float PadSlicerUI::xForPosition (double position) const
+{
+    const auto wave = waveformArea();
+    return wave.getX() + (float) ((position - viewStart) / (viewEnd - viewStart)) * wave.getWidth();
+}
+
+bool PadSlicerUI::canZoom() const
+{
+    return page == Page::slicer && thumbnail.getTotalLength() > 0.0;
+}
+
+void PadSlicerUI::zoomAround (double anchor, double factor)
+{
+    if (! canZoom())
+        return;
+
+    // Zoom in until about 1000 samples fill the screen
+    const int length = processorRef.getSliceLayout().length;
+    const double minimumWidth = length > 0 ? juce::jlimit (1.0 / 512.0, 1.0, 1024.0 / length) : 1.0 / 64.0;
+
+    const double width = viewEnd - viewStart;
+    const double newWidth = juce::jlimit (minimumWidth, 1.0, width / factor);
+    const double relative = (anchor - viewStart) / width;   // keep the anchor under the pointer
+    const double start = juce::jlimit (0.0, 1.0 - newWidth, anchor - relative * newWidth);
+
+    viewStart = start;
+    viewEnd = start + newWidth;
+    setStatus (newWidth >= 0.999 ? juce::String ("WHOLE LOOP") : "ZOOM X" + juce::String (1.0 / newWidth, 1));
+    repaint (lcdArea);
+}
+
+void PadSlicerUI::scrollView (double amount)
+{
+    const double width = viewEnd - viewStart;
+    viewStart = juce::jlimit (0.0, 1.0 - width, viewStart + amount * width);
+    viewEnd = viewStart + width;
+    repaint (lcdArea);
+}
+
+void PadSlicerUI::showWholeLoop()
+{
+    viewStart = 0.0;
+    viewEnd = 1.0;
+    setStatus ("WHOLE LOOP");
+    repaint (lcdArea);
+}
+
 juce::Rectangle<float> PadSlicerUI::markStripArea() const
 {
     return lcdContentArea.toFloat().removeFromBottom (14.0f);
@@ -774,12 +1262,10 @@ juce::Rectangle<float> PadSlicerUI::markStripArea() const
 
 int PadSlicerUI::sliceAt (float x, const Processor::SliceLayout& layout) const
 {
-    const auto wave = waveformArea();
-
-    if (layout.length <= 0 || wave.getWidth() <= 0.0f)
+    if (layout.length <= 0)
         return -1;
 
-    const float position = (x - wave.getX()) / wave.getWidth() * (float) layout.length;
+    const auto position = (float) (positionAt (x) * layout.length);
 
     for (size_t i = 0; i < layout.slices.size(); ++i)
         if (position >= (float) layout.slices[i].getStart() && position < (float) layout.slices[i].getEnd())
@@ -810,7 +1296,11 @@ void PadSlicerUI::drawWaveform (juce::Graphics& g, juce::Rectangle<float> area)
     const int selected = processorRef.selectedSlice.load();
     const float masterStart = processorRef.apvts.getRawParameterValue (Processor::startId)->load();
 
-    auto xFor = [&] (int sample) { return wave.getX() + wave.getWidth() * (float) sample / length; };
+    auto xFor = [&] (int sample) { return xForPosition ((double) sample / length); };
+
+    // Only draw inside the screen when zoomed in
+    const juce::Graphics::ScopedSaveState clipState (g);
+    g.reduceClipRegion (area.toNearestInt());
 
     // Selected and playing slices
     for (int i = 0; i < numSlices; ++i)
@@ -831,12 +1321,15 @@ void PadSlicerUI::drawWaveform (juce::Graphics& g, juce::Rectangle<float> area)
     const float midY = std::round (wave.getCentreY() / cell) * cell;
     const float halfHeight = wave.getHeight() * 0.5f - cell;
     const double seconds = thumbnail.getTotalLength();
+    const double viewWidth = viewEnd - viewStart;
     int slice = 0;
 
     for (int column = 0; column < columns; ++column)
     {
-        const double t0 = seconds * column / columns;
-        const double t1 = seconds * (column + 1) / columns;
+        const double p0 = viewStart + viewWidth * column / columns;
+        const double p1 = viewStart + viewWidth * (column + 1) / columns;
+        const double t0 = seconds * p0;
+        const double t1 = seconds * p1;
 
         float minValue = 0.0f, maxValue = 0.0f;
         thumbnail.getApproximateMinMax (t0, t1, 0, minValue, maxValue);
@@ -849,7 +1342,7 @@ void PadSlicerUI::drawWaveform (juce::Graphics& g, juce::Rectangle<float> area)
             maxValue = juce::jmax (maxValue, maxRight);
         }
 
-        const float position = ((float) column + 0.5f) / (float) columns * length;
+        const auto position = (float) ((p0 + p1) * 0.5) * length;
 
         while (slice < numSlices && position >= (float) layout.slices[(size_t) slice].getEnd())
             ++slice;
@@ -888,6 +1381,9 @@ void PadSlicerUI::drawWaveform (juce::Graphics& g, juce::Rectangle<float> area)
         const float x = std::round (xFor (region.getStart()));
         const float width = xFor (region.getEnd()) - xFor (region.getStart());
         const bool lit = isNoteLit (Processor::firstNote + i);
+
+        if (x + width < wave.getX() || x > wave.getRight())
+            continue;
 
         if (region.getStart() > 0)
         {
@@ -1003,7 +1499,7 @@ void PadSlicerUI::timerCallback()
         // Follow mode changes from automation, unless the FX page is open
         shownMode = mode;
 
-        if (page != Page::fx)
+        if (page == Page::slicer || page == Page::pads)
             page = mode == Processor::Mode::kit ? Page::pads : Page::slicer;
 
         repaint();
@@ -1014,6 +1510,8 @@ void PadSlicerUI::timerCallback()
     if (file != shownFile)
     {
         shownFile = file;
+        viewStart = 0.0;
+        viewEnd = 1.0;
         thumbnail.clear();
 
         if (file.existsAsFile())
@@ -1098,14 +1596,26 @@ void PadSlicerUI::updatePage()
     padGrid.setVisible (page == Page::pads);
     fxPanel.setVisible (page == Page::fx);
     fxPanel.updateEnabledStates();
+    genPanel.setVisible (page == Page::gen);
+
+    if (page == Page::gen)
+        genPanel.update();
 
     slicerTab.setToggleState (page == Page::slicer, juce::dontSendNotification);
     padsTab.setToggleState (page == Page::pads, juce::dontSendNotification);
     fxTab.setToggleState (page == Page::fx, juce::dontSendNotification);
+    genTab.setToggleState (page == Page::gen, juce::dontSendNotification);
 
     const bool byHits = processorRef.getSliceBy() == Processor::SliceBy::hits;
     gridChip.setVisible (page == Page::slicer);
     hitsChip.setVisible (page == Page::slicer);
+    for (auto* chip : { &zoomOutChip, &zoomInChip, &zoomAllChip })
+    {
+        chip->setVisible (page == Page::slicer);
+        chip->setEnabled (canZoom());
+    }
+
+    zoomAllChip.setToggleState (viewEnd - viewStart < 0.999, juce::dontSendNotification);
     gridChip.setToggleState (! byHits, juce::dontSendNotification);
     hitsChip.setToggleState (byHits, juce::dontSendNotification);
 
@@ -1136,7 +1646,7 @@ int PadSlicerUI::getEditTarget() const
     if (editMaster)
         return -1;
 
-    const bool kit = page == Page::pads || (page == Page::fx && processorRef.getMode() == Processor::Mode::kit);
+    const bool kit = page == Page::pads || (page != Page::slicer && processorRef.getMode() == Processor::Mode::kit);
 
     return kit ? Processor::padSettings (processorRef.selectedPad.load())
                : Processor::sliceSettings (processorRef.selectedSlice.load());
@@ -1218,7 +1728,7 @@ void PadSlicerUI::refreshKnobValues()
 
 void PadSlicerUI::updateEditChips()
 {
-    const bool kit = page == Page::pads || (page == Page::fx && processorRef.getMode() == Processor::Mode::kit);
+    const bool kit = page == Page::pads || (page != Page::slicer && processorRef.getMode() == Processor::Mode::kit);
     const int index = kit ? processorRef.selectedPad.load() : processorRef.selectedSlice.load();
     const auto note = juce::MidiMessage::getMidiNoteName (Processor::firstNote + index, true, true, 3);
 
@@ -1230,6 +1740,14 @@ void PadSlicerUI::updateEditChips()
 //==============================================================================
 void PadSlicerUI::mouseDown (const juce::MouseEvent& e)
 {
+    // Dragging the overview bar moves the zoomed view
+    if (canZoom() && viewEnd - viewStart < 0.999 && overviewArea().contains (e.position))
+    {
+        draggingOverview = true;
+        mouseDrag (e);
+        return;
+    }
+
     if (page != Page::slicer || shownFile == juce::File() || ! lcdContentArea.toFloat().contains (e.position))
         return;
 
@@ -1270,8 +1788,48 @@ void PadSlicerUI::mouseDown (const juce::MouseEvent& e)
     processorRef.keyboardState.noteOn (1, heldSliceNote, 1.0f);
 }
 
+void PadSlicerUI::mouseDrag (const juce::MouseEvent& e)
+{
+    if (! draggingOverview)
+        return;
+
+    const auto overview = overviewArea();
+    const double width = viewEnd - viewStart;
+    const double centre = (double) ((e.position.x - overview.getX()) / overview.getWidth());
+
+    viewStart = juce::jlimit (0.0, 1.0 - width, centre - width * 0.5);
+    viewEnd = viewStart + width;
+    repaint (lcdArea);
+}
+
+void PadSlicerUI::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
+{
+    if (! canZoom() || ! lcdContentArea.toFloat().contains (e.position))
+    {
+        Component::mouseWheelMove (e, wheel);
+        return;
+    }
+
+    // Sideways (or Shift+scroll) moves along the loop; up and down zooms around the pointer
+    const float sideways = e.mods.isShiftDown() ? wheel.deltaY : wheel.deltaX;
+
+    if (e.mods.isShiftDown() || std::abs (wheel.deltaX) > std::abs (wheel.deltaY))
+        scrollView (-(double) sideways * 2.0);
+    else
+        zoomAround (positionAt (e.position.x), std::pow (2.0, (double) wheel.deltaY * 4.0));
+}
+
+void PadSlicerUI::mouseMagnify (const juce::MouseEvent& e, float scaleFactor)
+{
+    // Trackpad pinch
+    if (canZoom() && lcdContentArea.toFloat().contains (e.position))
+        zoomAround (positionAt (e.position.x), (double) scaleFactor);
+}
+
 void PadSlicerUI::mouseUp (const juce::MouseEvent&)
 {
+    draggingOverview = false;
+
     if (heldSliceNote >= 0)
         processorRef.keyboardState.noteOff (1, heldSliceNote, 0.0f);
 
