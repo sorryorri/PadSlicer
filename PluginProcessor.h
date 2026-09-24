@@ -32,7 +32,7 @@ public:
 
     enum class Mode { slice = 0, kit = 1 };
     enum class Trigger { oneShot = 0, gate = 1 };
-    enum class SliceBy { grid = 0, hits = 1 };
+    enum class SliceBy { grid = 0, hits = 1, manual = 2 };
 
     // Parameter IDs, shared with the editor
     static constexpr const char* modeId     = "mode";
@@ -45,6 +45,8 @@ public:
     static constexpr const char* speedId    = "speed";
     static constexpr const char* pitchId    = "pitch";
     static constexpr const char* volumeId   = "volume";
+    static constexpr const char* syncId     = "sync";
+    static constexpr const char* loopBpmId  = "loopBpm";
 
     // FX parameter IDs, in signal-chain order. Each effect has an on switch and four
     // controls; the last control is always the mix.
@@ -116,6 +118,8 @@ public:
         juce::File file;
         juce::Range<juce::int64> region;
         int chopNumber = 0;
+        std::vector<int> manualStarts;   // slice lines placed by hand (slicer only)
+        double sourceBpm = 0.0;          // tempo of the loop a chop came from; 0 = not tempo-synced
 
         bool isEmpty() const { return file == juce::File(); }
         juce::String getLabel() const;
@@ -138,6 +142,13 @@ public:
     };
 
     SliceLayout getSliceLayout() const;
+
+    // Guesses the loop's tempo from its length (a power-of-two number of beats, as close to 120 BPM as possible)
+    double detectLoopBpm() const;
+    static double estimateBpm (double seconds);
+
+    // Sets the slicer's hand-placed slice lines (start samples) and switches to the EDIT layout
+    void setManualSlices (std::vector<int> starts);
 
     // Copies slices of the loop onto the empty pads, keeping their settings. onDone gets how many were sent.
     void sendSlicesToPads (const juce::Array<int>& slices, std::function<void (int sent)> onDone);
@@ -180,7 +191,22 @@ private:
     {
         juce::AudioBuffer<float> buffer;
         double sampleRate = 44100.0;
-        std::vector<int> hits;   // detected transients, used when slicing by hits
+        std::vector<int> hits;     // detected transients: slice lines when slicing by hits, and where grains restart
+        std::vector<int> manual;   // slice lines placed by hand
+        double sourceBpm = 0.0;    // for pads holding a chop: the tempo it was cut at
+    };
+
+    // Voices play through short overlapping grains, so pitch and tempo can change independently.
+    // With no pitch shift and no tempo change the grains line up exactly and the sound is untouched.
+    struct Grain
+    {
+        bool active = false;
+        double position = 0.0;    // read position in source samples
+        int age = 0;              // output samples since it started
+        bool fullStart = false;   // starts at full level, to keep a hit's attack
+        int fadeIn = 0;           // when > 0, fades in over this many samples (crossfading from the grains before)
+        int release = 0;          // when > 0, fading out quickly over this many samples
+        int releaseAge = 0;
     };
 
     struct Voice
@@ -190,8 +216,12 @@ private:
         int note = -1;
         int slot = 0;             // which sample slot this voice reads from
         int settingsIndex = 0;    // which slice or pad settings apply
-        double position = 0.0;    // read position in source samples
+        double timePos = 0.0;     // where the voice is in the source; moves at the tempo rate
+        int start = 0;            // where it started playing
         int end = 0;              // exclusive end of the region being played
+        std::array<Grain, 4> grains;
+        int grainClock = 0;       // output samples until the next grain
+        size_t nextHit = 0;       // next transient (index into the sample's hits) where grains restart
         float velocityGain = 0.0f;
         float envelope = 0.0f;    // short attack/release ramp to avoid clicks
         float gain = 1.0f;        // per-slot volume, ramped between blocks
@@ -200,8 +230,10 @@ private:
     };
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
-    static juce::Range<int> sliceRegion (int index, int length, SliceBy, int gridSlices, const std::vector<int>& hits);
-    static int sliceCount (int length, SliceBy, int gridSlices, const std::vector<int>& hits);
+    static const std::vector<int>* sliceLines (SliceBy, const std::vector<int>& hits, const std::vector<int>& manual);
+    static juce::Range<int> sliceRegion (int index, int length, SliceBy, int gridSlices,
+                                         const std::vector<int>& hits, const std::vector<int>& manual);
+    static int sliceCount (int length, SliceBy, int gridSlices, const std::vector<int>& hits, const std::vector<int>& manual);
 
     void timerCallback() override;
     std::unique_ptr<Sample> readSample (const juce::File&, juce::Range<juce::int64> region);
@@ -210,10 +242,11 @@ private:
     void detectHits (Sample&, float sensitivity);
 
     void handleMidiMessage (const juce::MidiMessage&);
-    void startVoice (int note, float velocity);
+    void startVoice (int note, float velocity, bool earnsXp);
     void releaseNote (int note);
     void releaseAllVoices();
     void renderVoices (juce::AudioBuffer<float>&, int startSample, int numSamples);
+    double alignGrain (const Sample&, const Voice&, double continuation, double target, double readRate) const;
     void processEffects (juce::AudioBuffer<float>&, int numSamples);
     void addPreviewNotes (juce::MidiBuffer&, int numSamples);
     double getHostBpm() const;
@@ -245,6 +278,7 @@ private:
     juce::SmoothedValue<float> gainSmoothed;
 
     double currentSampleRate = 44100.0;
+    int grainLength = 2048, grainHop = 1024, transientFade = 128;   // in output samples
     float attackStep = 1.0f;
     float releaseStep = 1.0f;
 
@@ -254,6 +288,9 @@ private:
     std::atomic<float> outputPeak { 0.0f };
 
     KnightProgress knightProgress;
+
+    // The generator's preview plays on its own MIDI channel, so its notes don't earn the knight XP
+    static constexpr int previewChannel = 16;
 
     std::unique_ptr<Generator::Pattern> previewPattern;   // guarded by patternLock
     juce::SpinLock patternLock;
@@ -272,6 +309,8 @@ private:
     std::atomic<float>* speedParam    = nullptr;
     std::atomic<float>* pitchParam    = nullptr;
     std::atomic<float>* volumeParam   = nullptr;
+    std::atomic<float>* syncParam     = nullptr;
+    std::atomic<float>* loopBpmParam  = nullptr;
 
     struct FxParams
     {

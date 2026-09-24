@@ -3,6 +3,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 
 #include "Knight.h"
+#include "PatternEditor.h"
 #include "PluginProcessor.h"
 #include "Retro.h"
 
@@ -106,13 +107,23 @@ private:
 
 //==============================================================================
 // The GEN page: makes MIDI patterns for the slices or pads, previews them and hands them to the DAW.
-class GenPanel final : public juce::Component
+class GenPanel final : public juce::Component,
+                       public juce::FileDragAndDropTarget
 {
 public:
     explicit GenPanel (PadSlicerAudioProcessor&);
 
     void paint (juce::Graphics&) override;
     void resized() override;
+
+    void paintOverChildren (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+
+    // MIDI files dropped on the page are imported into the pattern
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void fileDragEnter (const juce::StringArray& files, int x, int y) override;
+    void fileDragExit (const juce::StringArray& files) override;
+    void filesDropped (const juce::StringArray& files, int x, int y) override;
 
     // Called regularly while the page is showing: keeps the pattern in step with the slices or pads
     void update();
@@ -126,19 +137,27 @@ private:
         juce::Label label;
     };
 
+    void setEditing (bool shouldEdit);
+
     std::vector<Generator::Source> collectSources (double& loopBeats) const;
     void generateNew();
     void regenerate();
     juce::String getClipName() const;
     juce::File writeMidiFile (const juce::File& file) const;
     void saveMidiFile();
+    void chooseMidiFile();
+    void importMidiFile (const juce::File&);
+    void syncKnobs();
 
     PadSlicerAudioProcessor& processorRef;
 
     Retro::ChipButton generateChip { "GENERATE", Retro::ChipButton::Style::lcd };
     Retro::ChipButton playChip { "PLAY", Retro::ChipButton::Style::lcd };
     Retro::ChipButton saveChip { "SAVE", Retro::ChipButton::Style::lcd };
+    Retro::ChipButton editChip { "EDIT", Retro::ChipButton::Style::lcd };
+    Retro::ChipButton importChip { "IMPORT", Retro::ChipButton::Style::lcd };
     MidiDragButton dragButton;
+    PatternEditor editor;
     std::array<MiniKnob, Generator::numControls> knobs;
     std::unique_ptr<juce::FileChooser> chooser;
 
@@ -146,7 +165,39 @@ private:
     juce::String sourcesKey;
     juce::Rectangle<int> patternArea;
 
+    bool editing = false;
+    bool dropHover = false;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GenPanel)
+};
+
+//==============================================================================
+// The loop's tempo, shown on the screen. Drag up or down to change it (Shift for fine steps),
+// double-click to detect it again, right-click for x2 / half.
+class BpmField final : public juce::Component
+{
+public:
+    BpmField (juce::RangedAudioParameter&, std::function<double()> detectBpm);
+
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+
+    std::function<void (const juce::String&)> onStatus;
+
+private:
+    void setBpm (double bpm);
+    void showMenu();
+
+    std::function<double()> detectBpm;
+    juce::ParameterAttachment attachment;
+    float value = 120.0f;
+    float dragStartValue = 120.0f;
+    bool dragging = false;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BpmField)
 };
 
 //==============================================================================
@@ -173,6 +224,8 @@ public:
     void mouseDown (const juce::MouseEvent&) override;
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp (const juce::MouseEvent&) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
     void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
     void mouseMagnify (const juce::MouseEvent&, float scaleFactor) override;
 
@@ -223,6 +276,7 @@ private:
     juce::Rectangle<float> markStripArea() const;
     juce::Rectangle<float> overviewArea() const;
     int sliceAt (float x, const Processor::SliceLayout&) const;
+    int lineAt (juce::Point<float>, const Processor::SliceLayout&) const;   // slice line under the pointer, or -1
 
     // Zooming the slicer's view of the loop. Positions are fractions of the loop's length.
     double positionAt (float x) const;
@@ -243,7 +297,11 @@ private:
     Retro::ArcadeButton loadButton    { "LOAD", Retro::Palette::gold };
     Retro::ArcadeButton triggerButton { "TRIG", Retro::Palette::coral };
     Retro::TabButton slicerTab { "SLICER" }, padsTab { "PADS" }, fxTab { "FX" }, genTab { "GEN" };
-    Retro::ChipButton gridChip { "GRID", Retro::ChipButton::Style::lcd }, hitsChip { "HITS", Retro::ChipButton::Style::lcd };
+    Retro::ChipButton gridChip { "GRID", Retro::ChipButton::Style::lcd }, hitsChip { "HITS", Retro::ChipButton::Style::lcd },
+                      manualChip { "EDIT", Retro::ChipButton::Style::lcd };
+    Retro::ChipButton syncChip { "SYNC", Retro::ChipButton::Style::lcd };
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> syncAttachment;
+    BpmField bpmField;
     Retro::ChipButton zoomOutChip { "-", Retro::ChipButton::Style::lcd }, zoomInChip { "+", Retro::ChipButton::Style::lcd },
                       zoomAllChip { "ALL", Retro::ChipButton::Style::lcd };
     Retro::ChipButton slotChip { "", Retro::ChipButton::Style::panel }, masterChip { "MASTER", Retro::ChipButton::Style::panel };
@@ -277,6 +335,11 @@ private:
     // The part of the loop the slicer shows
     double viewStart = 0.0, viewEnd = 1.0;
     bool draggingOverview = false;
+
+    // Slice line being dragged, and the lines as they were when the drag started
+    int draggingLine = -1;
+    int hoverLine = -1;
+    std::vector<int> dragLines;
 
     // What the knobs are currently connected to
     bool editMaster = false;

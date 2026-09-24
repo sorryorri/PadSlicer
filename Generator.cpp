@@ -65,14 +65,84 @@ Settings::Settings()
 }
 
 //==============================================================================
+double getBarsChoiceBeats (int barsIndex)
+{
+    return barBeats[(size_t) juce::jlimit (0, 3, barsIndex)];
+}
+
+double getPatternBeats (const Settings& settings)
+{
+    return barBeats[(size_t) juce::jlimit (0, 3, settings.getInt (bars))];
+}
+
+double getStepBeats (const Settings& settings)
+{
+    return 1.0 / gridStepsPerBeat[(size_t) juce::jlimit (0, 4, settings.getInt (grid))];
+}
+
+double getStepStart (const Settings& settings, int step)
+{
+    const bool triplets = settings.getInt (grid) >= 3;
+    const double stepBeats = getStepBeats (settings);
+    const double swingDelay = triplets ? 0.0 : settings.getAmount (swing) * 0.5 * stepBeats;
+    return step * stepBeats + (step % 2 == 1 ? swingDelay : 0.0);
+}
+
+double getDrawnNoteBeats (const Settings& settings)
+{
+    const double length = noteBeats[(size_t) juce::jlimit (0, 5, settings.getInt (noteLength))];
+    return length > 0.0 ? length : getStepBeats (settings);
+}
+
+bool isSameNote (const Note& note, const EditKey& key)
+{
+    return note.note == key.note && std::abs (note.start - key.start) < 1.0e-4;
+}
+
+namespace
+{
+    void generateNotes (Pattern& pattern, const Settings& settings, const std::vector<Source>& allSources, double loopBeats);
+
+    void applyEdits (Pattern& pattern, const Settings& settings)
+    {
+        auto& notes = pattern.notes;
+
+        notes.erase (std::remove_if (notes.begin(), notes.end(), [&settings] (const Note& note)
+                     {
+                         return std::any_of (settings.removed.begin(), settings.removed.end(),
+                                             [&note] (const EditKey& key) { return isSameNote (note, key); });
+                     }),
+                     notes.end());
+
+        for (auto note : settings.added)
+        {
+            if (note.start >= pattern.lengthBeats)
+                continue;
+
+            note.length = juce::jmax (0.01, juce::jmin (note.length, pattern.lengthBeats - note.start));
+            notes.push_back (note);
+        }
+
+        std::sort (notes.begin(), notes.end(), [] (const Note& a, const Note& b) { return a.start < b.start; });
+    }
+}
+
 Pattern generate (const Settings& settings, const std::vector<Source>& allSources, double loopBeats)
 {
     Pattern pattern;
-    pattern.lengthBeats = barBeats[(size_t) juce::jlimit (0, 3, settings.getInt (bars))];
+    pattern.lengthBeats = getPatternBeats (settings);
 
-    if (allSources.empty() || settings.seed == 0)
-        return pattern;
+    if (! allSources.empty() && settings.seed != 0)
+        generateNotes (pattern, settings, allSources, loopBeats);
 
+    applyEdits (pattern, settings);
+    return pattern;
+}
+
+namespace
+{
+void generateNotes (Pattern& pattern, const Settings& settings, const std::vector<Source>& allSources, double loopBeats)
+{
     juce::Random random (settings.seed);
 
     // RANGE: use only some of the slices or pads, picked by the seed
@@ -194,8 +264,7 @@ Pattern generate (const Settings& settings, const std::vector<Source>& allSource
         // Keep everything inside the clip
         n.length = juce::jmax (0.01, juce::jmin (n.length, pattern.lengthBeats - n.start));
     }
-
-    return pattern;
+}
 }
 
 juce::MidiFile toMidiFile (const Pattern& pattern)

@@ -6,11 +6,12 @@ Built with [JUCE](https://juce.com). Runs as an Audio Unit, VST3 or standalone a
 
 ## Features
 
-- **Slicer**: drop a loop and cut it into an even grid (1–64 slices) or at every detected hit. Slices play from C1 (MIDI note 36) upwards. Scroll or pinch over the waveform to zoom in.
+- **Slicer**: drop a loop and cut it into an even grid (1–64 slices) or at every detected hit. Slices play from C1 (MIDI note 36) upwards. Scroll or pinch over the waveform to zoom in, then drag the slice lines to fine-tune them (double-click adds a line, Option-click removes one).
+- **Tempo sync and pitch**: loops play at your DAW's tempo without changing pitch (SYNC, with the loop's BPM detected from its length), and PITCH changes pitch without changing length. Hits stay tight thanks to a grain engine that restarts on every transient. SPEED is tape-style and changes both.
 - **Pads**: 16 Drum Rack–style pads for one-shots. Tick slices in the slicer and press **TRANSFER** to send them to empty pads.
-- **Per-slice and per-pad settings**: start, pitch (±24 semitones), speed, low-pass cutoff and volume for every slice and pad, plus master controls that can be automated in your DAW.
+- **Per-slice and per-pad settings**: start, pitch (±24 semitones, keeps the length), speed, low-pass cutoff and volume for every slice and pad, plus master controls that can be automated in your DAW.
 - **Trigger / Gate** playback, sample-accurate MIDI, 16 voices.
-- **Pattern generator** (GEN page): every press of GENERATE makes a new MIDI pattern for the slices or pads, shaped by bars, grid, note length, density, swing, order, variation, rolls, accent and range. Preview it in the plugin, then drag it onto a DAW track as a MIDI clip or save it as a .mid file.
+- **Pattern generator** (GEN page): every press of GENERATE makes a new MIDI pattern for the slices or pads, shaped by bars, grid, note length, density, swing, order, variation, rolls, accent and range. Edit it in a piano roll that works like Ableton's MIDI editor (select notes or bars, Delete, Cmd+D duplicate, Cmd+C/X/V, Cmd+Z, arrow keys, B for draw mode); your edits survive knob tweaks. Or import a MIDI file by dropping it on the page. Preview it in the plugin, then drag it onto a DAW track as a MIDI clip or save it as a .mid file. Previewing doesn't earn the knight XP.
 - **FX**: Juno-style chorus, analog-style flanger, tempo-synced tape echo and a Dattorro plate reverb.
 - **Retro UI**: pixel-art interface drawn entirely in code, with an amber LCD and a resizable window (75–200%).
 - **Sir Slicealot**: every hit earns XP. He levels up through 8 ranks, each with new gear and scenery.

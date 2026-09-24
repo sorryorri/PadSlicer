@@ -8,6 +8,9 @@ namespace
     constexpr float releaseSeconds = 0.010f;
     constexpr double declickSeconds = 0.002;   // fade applied as a voice reaches the end of its region
     constexpr double maxSampleSeconds = 600.0;
+    constexpr double grainSeconds = 0.05;           // each grain; they overlap by half
+    constexpr double transientFadeSeconds = 0.0015; // crossfade from the old grains into a new hit
+    constexpr double alignSeconds = 0.012;          // how far a grain may be nudged to line up with the last one
 
     // Tempo-synced echo times
     struct Division
@@ -102,6 +105,8 @@ PadSlicerAudioProcessor::PadSlicerAudioProcessor()
     speedParam   = apvts.getRawParameterValue (speedId);
     pitchParam   = apvts.getRawParameterValue (pitchId);
     volumeParam  = apvts.getRawParameterValue (volumeId);
+    syncParam    = apvts.getRawParameterValue (syncId);
+    loopBpmParam = apvts.getRawParameterValue (loopBpmId);
 
     auto bindFx = [this] (FxParams& params, const FxIds& ids)
     {
@@ -154,9 +159,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout PadSlicerAudioProcessor::cre
     layout.add (std::make_unique<AudioParameterInt> (ParameterID { slicesId, 1 }, "Slices",
                                                      1, maxSlices, 16));
 
-    // Grid = even slices, Hits = one slice per detected transient
+    // Grid = even slices, Hits = one slice per detected transient, Manual = slice lines placed by hand
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { sliceById, 1 }, "Slice By",
-                                                        StringArray { "Grid", "Hits" }, 0));
+                                                        StringArray { "Grid", "Hits", "Manual" }, 0));
 
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { hitSensId, 1 }, "Hit Sensitivity",
                                                        NormalisableRange<float> (0.0f, 100.0f, 1.0f), 50.0f,
@@ -197,6 +202,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout PadSlicerAudioProcessor::cre
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { volumeId, 1 }, "Master Volume",
                                                        NormalisableRange<float> (-60.0f, 6.0f, 0.1f), 0.0f,
                                                        AudioParameterFloatAttributes().withLabel ("dB")));
+
+    // Tempo sync: loops (and chops cut from them) play at the host's tempo without changing pitch
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { syncId, 1 }, "Tempo Sync", true));
+
+    // The loop's own tempo. Set from the loop's length when one is loaded; can be changed by hand.
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { loopBpmId, 1 }, "Loop BPM",
+                                                       NormalisableRange<float> (40.0f, 300.0f, 0.01f), 120.0f,
+                                                       AudioParameterFloatAttributes().withLabel ("BPM")));
 
     //==============================================================================
     auto addSwitch = [&layout] (const char* id, const char* name)
@@ -313,6 +326,10 @@ void PadSlicerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBl
 {
     currentSampleRate = sampleRate;
 
+    grainLength = juce::jmax (64, juce::roundToInt (grainSeconds * sampleRate));
+    grainHop = grainLength / 2;
+    transientFade = juce::jmax (8, juce::roundToInt (transientFadeSeconds * sampleRate));
+
     attackStep  = 1.0f / juce::jmax (1.0f, attackSeconds  * (float) sampleRate);
     releaseStep = 1.0f / juce::jmax (1.0f, releaseSeconds * (float) sampleRate);
 
@@ -422,16 +439,26 @@ void PadSlicerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const int numChannels = buffer.getNumChannels();
     auto* const* channels = buffer.getArrayOfWritePointers();
 
-    for (int i = 0; i < numSamples; ++i)
+    // Fully open means no filter at all, so the sound passes through untouched
+    const bool filterOpen = ! cutoffSmoothed.isSmoothing() && cutoffParam->load() >= 19900.0f;
+
+    if (filterOpen)
     {
-        if (cutoffSmoothed.isSmoothing())
-            filter.setCutoffFrequency (cutoffSmoothed.getNextValue());
-
-        for (int ch = 0; ch < numChannels; ++ch)
-            channels[ch][i] = filter.processSample (ch, channels[ch][i]);
+        filter.reset();
     }
+    else
+    {
+        for (int i = 0; i < numSamples; ++i)
+        {
+            if (cutoffSmoothed.isSmoothing())
+                filter.setCutoffFrequency (cutoffSmoothed.getNextValue());
 
-    filter.snapToZero();
+            for (int ch = 0; ch < numChannels; ++ch)
+                channels[ch][i] = filter.processSample (ch, channels[ch][i]);
+        }
+
+        filter.snapToZero();
+    }
 
     processEffects (buffer, numSamples);
 
@@ -491,7 +518,7 @@ void PadSlicerAudioProcessor::addPreviewNotes (juce::MidiBuffer& midi, int numSa
     {
         if (previewWasOn)
         {
-            midi.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+            midi.addEvent (juce::MidiMessage::allNotesOff (previewChannel), 0);
             previewWasOn = false;
         }
 
@@ -535,10 +562,10 @@ void PadSlicerAudioProcessor::addPreviewNotes (juce::MidiBuffer& midi, int numSa
 
     // Note-offs first, so a note ending exactly where the next one starts doesn't cut it off
     for (const auto& note : pattern.notes)
-        addIfInBlock (std::fmod (note.start + note.length, length), juce::MidiMessage::noteOff (1, note.note));
+        addIfInBlock (std::fmod (note.start + note.length, length), juce::MidiMessage::noteOff (previewChannel, note.note));
 
     for (const auto& note : pattern.notes)
-        addIfInBlock (note.start, juce::MidiMessage::noteOn (1, note.note, note.velocity));
+        addIfInBlock (note.start, juce::MidiMessage::noteOn (previewChannel, note.note, note.velocity));
 
     previewBeat = end;
     previewPosition = std::fmod (juce::jmax (0.0, end), length);
@@ -558,7 +585,7 @@ void PadSlicerAudioProcessor::handleMidiMessage (const juce::MidiMessage& messag
 {
     if (message.isNoteOn())
     {
-        startVoice (message.getNoteNumber(), message.getFloatVelocity());
+        startVoice (message.getNoteNumber(), message.getFloatVelocity(), message.getChannel() != previewChannel);
     }
     else if (message.isNoteOff())
     {
@@ -573,30 +600,43 @@ void PadSlicerAudioProcessor::handleMidiMessage (const juce::MidiMessage& messag
 }
 
 //==============================================================================
-int PadSlicerAudioProcessor::sliceCount (int length, SliceBy sliceBy, int gridSlices, const std::vector<int>& hits)
+const std::vector<int>* PadSlicerAudioProcessor::sliceLines (SliceBy sliceBy, const std::vector<int>& hits,
+                                                              const std::vector<int>& manual)
+{
+    if (sliceBy == SliceBy::hits && ! hits.empty())
+        return &hits;
+
+    if (sliceBy == SliceBy::manual && ! manual.empty())
+        return &manual;
+
+    return nullptr;   // an even grid
+}
+
+int PadSlicerAudioProcessor::sliceCount (int length, SliceBy sliceBy, int gridSlices,
+                                         const std::vector<int>& hits, const std::vector<int>& manual)
 {
     if (length <= 0)
         return 0;
 
-    if (sliceBy == SliceBy::hits && ! hits.empty())
-        return juce::jmin ((int) hits.size(), maxSlices);
+    if (const auto* lines = sliceLines (sliceBy, hits, manual))
+        return juce::jmin ((int) lines->size(), maxSlices);
 
     return juce::jlimit (1, maxSlices, gridSlices);
 }
 
 juce::Range<int> PadSlicerAudioProcessor::sliceRegion (int index, int length, SliceBy sliceBy, int gridSlices,
-                                                       const std::vector<int>& hits)
+                                                       const std::vector<int>& hits, const std::vector<int>& manual)
 {
-    const int count = sliceCount (length, sliceBy, gridSlices, hits);
+    const int count = sliceCount (length, sliceBy, gridSlices, hits, manual);
 
     if (index < 0 || index >= count)
         return {};
 
-    // Hit slices run from one hit to the next; if no hits were found, fall back to the grid
-    if (sliceBy == SliceBy::hits && ! hits.empty())
+    // Hit and hand-placed slices run from one line to the next; with no lines, fall back to the grid
+    if (const auto* lines = sliceLines (sliceBy, hits, manual))
     {
-        const int start = juce::jlimit (0, length, hits[(size_t) index]);
-        const int end = index + 1 < (int) hits.size() ? hits[(size_t) index + 1] : length;
+        const int start = juce::jlimit (0, length, (*lines)[(size_t) index]);
+        const int end = index + 1 < (int) lines->size() ? (*lines)[(size_t) index + 1] : length;
         return { start, juce::jlimit (start, length, end) };
     }
 
@@ -604,11 +644,12 @@ juce::Range<int> PadSlicerAudioProcessor::sliceRegion (int index, int length, Sl
     return { (int) std::round (index * sliceLength), (int) std::round ((index + 1) * sliceLength) };
 }
 
-void PadSlicerAudioProcessor::startVoice (int note, float velocity)
+void PadSlicerAudioProcessor::startVoice (int note, float velocity, bool earnsXp)
 {
     const int index = note - firstNote;
     int slot = 0, settingsIndex = 0;
     juce::Range<int> region;
+    const Sample* source = nullptr;
 
     if (getMode() == Mode::kit)
     {
@@ -617,7 +658,8 @@ void PadSlicerAudioProcessor::startVoice (int note, float velocity)
 
         slot = index;
         settingsIndex = padSettings (index);
-        region = { 0, samples[(size_t) slot]->buffer.getNumSamples() };
+        source = samples[(size_t) slot].get();
+        region = { 0, source->buffer.getNumSamples() };
     }
     else
     {
@@ -626,13 +668,14 @@ void PadSlicerAudioProcessor::startVoice (int note, float velocity)
         if (loop == nullptr)
             return;
 
-        region = sliceRegion (index, loop->buffer.getNumSamples(), getSliceBy(), (int) slicesParam->load(), loop->hits);
+        region = sliceRegion (index, loop->buffer.getNumSamples(), getSliceBy(), (int) slicesParam->load(), loop->hits, loop->manual);
 
         if (region.isEmpty())
             return;
 
         slot = sliceSlot;
         settingsIndex = sliceSettings (index);
+        source = loop;
     }
 
     const float startPercent = juce::jlimit (0.0f, 95.0f, getSetting (settingsIndex, startControl) + startParam->load());
@@ -669,8 +712,17 @@ void PadSlicerAudioProcessor::startVoice (int note, float velocity)
     target->note = note;
     target->slot = slot;
     target->settingsIndex = settingsIndex;
-    target->position = playStart;
+    target->timePos = playStart;
+    target->start = playStart;
     target->end = region.getEnd();
+
+    // The first grain starts at full level right on the hit, so its attack stays sharp
+    target->grains = {};
+    target->grains[0].active = true;
+    target->grains[0].position = playStart;
+    target->grains[0].fullStart = true;
+    target->grainClock = grainHop;
+    target->nextHit = (size_t) (std::upper_bound (source->hits.begin(), source->hits.end(), playStart) - source->hits.begin());
     target->velocityGain = velocity;
     target->envelope = 0.0f;
     target->gain = juce::Decibels::decibelsToGain (getSetting (settingsIndex, volumeControl), -60.0f);
@@ -679,7 +731,9 @@ void PadSlicerAudioProcessor::startVoice (int note, float velocity)
 
     lastHitNote = note;
     ++hitCount;
-    knightProgress.addHit();
+
+    if (earnsXp)
+        knightProgress.addHit();
 }
 
 void PadSlicerAudioProcessor::releaseNote (int note)
@@ -698,9 +752,51 @@ void PadSlicerAudioProcessor::releaseAllVoices()
 
 void PadSlicerAudioProcessor::renderVoices (juce::AudioBuffer<float>& output, int startSample, int numSamples)
 {
-    const int numOutputChannels = output.getNumChannels();
+    const int numOutputChannels = juce::jmin (2, output.getNumChannels());
     const float masterSpeed = speedParam->load();
     const float masterPitch = pitchParam->load();
+    const bool sync = syncParam->load() > 0.5f;
+    const double hostBpm = lastBpm.load();
+    const auto twoPi = juce::MathConstants<float>::twoPi;
+
+    // Starts a grain; a full-start grain (on a hit) crossfades from the ones already playing
+    auto startGrain = [this] (Voice& voice, double position, bool fullStart)
+    {
+        const bool crossfade = fullStart && std::any_of (voice.grains.begin(), voice.grains.end(),
+                                                         [] (const Grain& g) { return g.active; });
+
+        if (fullStart)
+        {
+            for (auto& grain : voice.grains)
+            {
+                if (grain.active && grain.release == 0)
+                {
+                    grain.release = transientFade;
+                    grain.releaseAge = 0;
+                }
+            }
+        }
+
+        auto* slot = &voice.grains[0];
+
+        for (auto& grain : voice.grains)
+        {
+            if (! grain.active)
+            {
+                slot = &grain;
+                break;
+            }
+
+            if (grain.age > slot->age)
+                slot = &grain;
+        }
+
+        *slot = {};
+        slot->active = true;
+        slot->position = position;
+        slot->fullStart = fullStart;
+        slot->fadeIn = crossfade ? transientFade : 0;
+    };
 
     for (auto& voice : voices)
     {
@@ -715,10 +811,15 @@ void PadSlicerAudioProcessor::renderVoices (juce::AudioBuffer<float>& output, in
             continue;
         }
 
-        // The slice's or pad's own settings, read per sub-block so knob moves affect notes already playing
+        // The slice's or pad's own settings, read per sub-block so knob moves affect notes already playing.
+        // SPEED is tape-style (pitch and tempo together); PITCH only changes pitch; tempo sync only changes tempo.
         const float pitch = masterPitch + getSetting (voice.settingsIndex, pitchControl);
-        const float speed = masterSpeed * getSetting (voice.settingsIndex, speedControl);
-        const double increment = speed * std::exp2 (pitch / 12.0) * s->sampleRate / currentSampleRate;
+        const double speed = masterSpeed * getSetting (voice.settingsIndex, speedControl);
+        const double sourceBpm = voice.slot == sliceSlot ? (double) loopBpmParam->load() : s->sourceBpm;
+        const double tempoRatio = sync && sourceBpm > 0.0 ? hostBpm / sourceBpm : 1.0;
+        const double rateToSource = s->sampleRate / currentSampleRate;
+        const double timeRate = speed * tempoRatio * rateToSource;
+        const double readRate = speed * std::exp2 (pitch / 12.0) * rateToSource;
 
         const float targetGain = juce::Decibels::decibelsToGain (getSetting (voice.settingsIndex, volumeControl), -60.0f);
         const float gainStep = (targetGain - voice.gain) / (float) juce::jmax (1, numSamples);
@@ -730,7 +831,8 @@ void PadSlicerAudioProcessor::renderVoices (juce::AudioBuffer<float>& output, in
             voice.filter.setCutoffFrequency (cutoff);
 
         const int numSourceChannels = s->buffer.getNumChannels();
-        const double declickLength = juce::jmax (1.0, s->sampleRate * declickSeconds);
+        const auto declickLength = (float) juce::jmax (1.0, s->sampleRate * declickSeconds);
+        const auto& hits = s->hits;
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -749,35 +851,188 @@ void PadSlicerAudioProcessor::renderVoices (juce::AudioBuffer<float>& output, in
                 voice.envelope = juce::jmin (1.0f, voice.envelope + attackStep);
             }
 
-            const int index = (int) voice.position;
+            // A hit inside the region restarts the grains right on it, so hits stay tight when stretched
+            while (voice.nextHit < hits.size() && (double) hits[voice.nextHit] <= voice.timePos)
+            {
+                const int hit = hits[voice.nextHit++];
 
-            if (index >= voice.end)
+                if (hit < voice.end - 1)
+                {
+                    startGrain (voice, hit, true);
+                    voice.grainClock = grainHop;
+                }
+            }
+
+            if (voice.timePos < voice.end && --voice.grainClock <= 0)
+            {
+                double position = voice.timePos;
+
+                // When stretching or pitching, nudge the grain to line up with the one it overlaps (WSOLA),
+                // which keeps tones smooth. Without either, grains already line up exactly.
+                if (std::abs (readRate - timeRate) > 1.0e-6 * readRate)
+                {
+                    const Grain* previous = nullptr;
+
+                    for (const auto& grain : voice.grains)
+                        if (grain.active && grain.release == 0 && (previous == nullptr || grain.age < previous->age))
+                            previous = &grain;
+
+                    if (previous != nullptr)
+                        position = alignGrain (*s, voice, previous->position, position, readRate);
+                }
+
+                startGrain (voice, position, false);
+                voice.grainClock = grainHop;
+            }
+
+            // Mix the grains. Each one fades in and out (Hann); overlapping by half, they add up to a steady level.
+            float mixed[2] = { 0.0f, 0.0f };
+            bool anyGrain = false;
+
+            for (auto& grain : voice.grains)
+            {
+                if (! grain.active)
+                    continue;
+
+                const float phase = (float) grain.age / (float) grainLength;
+                float weight = grain.fullStart && phase < 0.5f ? 1.0f : 0.5f - 0.5f * std::cos (twoPi * phase);
+
+                if (grain.fadeIn > 0 && grain.age < grain.fadeIn)
+                    weight *= (float) grain.age / (float) grain.fadeIn;
+
+                if (grain.release > 0)
+                    weight *= 1.0f - (float) grain.releaseAge / (float) grain.release;
+
+                const int index = (int) grain.position;
+
+                if (index >= 0 && index < voice.end - 1)
+                {
+                    // Fade out just before the region ends, so nothing clicks or spills into the next slice
+                    weight *= juce::jmin (1.0f, (float) (voice.end - grain.position) / declickLength);
+
+                    const float frac = (float) (grain.position - index);
+
+                    for (int ch = 0; ch < numOutputChannels; ++ch)
+                    {
+                        const float* src = s->buffer.getReadPointer (juce::jmin (ch, numSourceChannels - 1));
+                        mixed[ch] += weight * (src[index] + frac * (src[index + 1] - src[index]));
+                    }
+                }
+
+                grain.position += readRate;
+                ++grain.age;
+
+                if (grain.age >= grainLength || (grain.release > 0 && ++grain.releaseAge >= grain.release))
+                    grain.active = false;
+
+                anyGrain = anyGrain || grain.active;
+            }
+
+            voice.timePos += timeRate;
+
+            if (voice.timePos >= voice.end && ! anyGrain)
             {
                 voice.active = false;
                 break;
             }
 
             voice.gain += gainStep;
-
-            const int next = juce::jmin (index + 1, voice.end - 1);
-            const float frac = (float) (voice.position - index);
-            const float edgeFade = (float) juce::jmin (1.0, (voice.end - voice.position) / declickLength);
-            const float gain = voice.velocityGain * voice.envelope * edgeFade * voice.gain;
+            const float gain = voice.velocityGain * voice.envelope * voice.gain;
 
             for (int ch = 0; ch < numOutputChannels; ++ch)
             {
-                const float* src = s->buffer.getReadPointer (juce::jmin (ch, numSourceChannels - 1));
-                float value = src[index] + frac * (src[next] - src[index]);
+                float value = mixed[ch];
 
                 if (filtering)
-                    value = voice.filter.processSample (juce::jmin (ch, 1), value);
+                    value = voice.filter.processSample (ch, value);
 
                 output.addSample (ch, startSample + i, gain * value);
             }
-
-            voice.position += increment;
         }
     }
+}
+
+double PadSlicerAudioProcessor::alignGrain (const Sample& s, const Voice& voice, double continuation,
+                                           double target, double readRate) const
+{
+    // Finds the start near `target` whose audio best matches where the previous grain is heading
+    constexpr int points = 128;
+    const float* data = s.buffer.getReadPointer (0);
+    const double step = readRate * 2.0;   // compare every second output sample
+    const int end = voice.end;
+    const int radius = juce::roundToInt (alignSeconds * s.sampleRate);
+
+    auto sampleAt = [data, end] (double position)
+    {
+        const int index = (int) position;
+
+        if (index < 0 || index + 1 >= end)
+            return 0.0f;
+
+        const float frac = (float) (position - index);
+        return data[index] + frac * (data[index + 1] - data[index]);
+    };
+
+    std::array<float, points> reference;
+
+    for (int k = 0; k < points; ++k)
+        reference[(size_t) k] = sampleAt (continuation + k * step);
+
+    auto score = [&] (double start)
+    {
+        double dot = 0.0, energy = 1.0e-9;
+
+        for (int k = 0; k < points; ++k)
+        {
+            const float v = sampleAt (start + k * step);
+            dot += v * reference[(size_t) k];
+            energy += v * v;
+        }
+
+        return dot / std::sqrt (energy);
+    };
+
+    const double lowest = voice.start;
+    const double highest = end - points * step - 2.0;
+
+    if (highest <= lowest)
+        return target;
+
+    double best = juce::jlimit (lowest, highest, target);
+    double bestScore = score (best);
+
+    // Coarse search, then refine around the best match
+    for (int offset = -radius; offset <= radius; offset += 4)
+    {
+        const double candidate = target + offset;
+
+        if (candidate < lowest || candidate > highest)
+            continue;
+
+        if (const double candidateScore = score (candidate); candidateScore > bestScore)
+        {
+            bestScore = candidateScore;
+            best = candidate;
+        }
+    }
+
+    const double coarse = best;
+
+    for (int offset = -3; offset <= 3; ++offset)
+    {
+        const double candidate = coarse + offset;
+
+        if (candidate < lowest || candidate > highest || offset == 0)
+            continue;
+
+        if (const double candidateScore = score (candidate); candidateScore > bestScore)
+        {
+            bestScore = candidateScore;
+            best = candidate;
+        }
+    }
+
+    return best;
 }
 
 //==============================================================================
@@ -853,8 +1108,12 @@ void PadSlicerAudioProcessor::startLoad (int slot, const SlotInfo& info, std::fu
         {
             const int length = sample->buffer.getNumSamples();
 
+            // Hits mark where grains restart (and, for the loop, the slice lines when slicing by hits)
+            detectHits (*sample, hitSensParam->load() / 100.0f);
+            sample->sourceBpm = info.sourceBpm;
+
             if (slot == sliceSlot)
-                detectHits (*sample, hitSensParam->load() / 100.0f);
+                sample->manual = info.manualStarts;
 
             auto hits = sample->hits;
 
@@ -889,6 +1148,11 @@ void PadSlicerAudioProcessor::loadSampleAsync (int slot, const juce::File& file,
     // A new sample starts with fresh settings
     if (slot == sliceSlot)
     {
+        // Hand-placed lines belonged to the old loop
+        if (getSliceBy() == SliceBy::manual)
+            if (auto* parameter = apvts.getParameter (sliceById))
+                parameter->setValueNotifyingHost (parameter->convertTo0to1 ((float) SliceBy::grid));
+
         for (int slice = 0; slice < maxSlices; ++slice)
             resetSettings (sliceSettings (slice));
 
@@ -902,7 +1166,67 @@ void PadSlicerAudioProcessor::loadSampleAsync (int slot, const juce::File& file,
 
     SlotInfo info;
     info.file = file;
+
+    // A new loop gets its tempo from its length
+    if (slot == sliceSlot)
+    {
+        juce::WeakReference<PadSlicerAudioProcessor> weakThis (this);
+
+        startLoad (slot, info, [weakThis, onDone] (bool ok)
+        {
+            if (ok && weakThis != nullptr)
+                if (const double bpm = weakThis->detectLoopBpm(); bpm > 0.0)
+                    if (auto* parameter = weakThis->apvts.getParameter (loopBpmId))
+                        parameter->setValueNotifyingHost (parameter->convertTo0to1 ((float) bpm));
+
+            if (onDone != nullptr)
+                onDone (ok);
+        });
+
+        return;
+    }
+
     startLoad (slot, info, std::move (onDone));
+}
+
+double PadSlicerAudioProcessor::estimateBpm (double seconds)
+{
+    if (seconds <= 0.0)
+        return 0.0;
+
+    double best = 0.0, bestDistance = 1.0e9;
+
+    for (double beats = 1.0; beats <= 64.0; beats *= 2.0)
+    {
+        const double bpm = beats * 60.0 / seconds;
+
+        if (bpm < 40.0 || bpm > 300.0)
+            continue;
+
+        const double distance = std::abs (std::log2 (bpm / 120.0));
+
+        if (distance < bestDistance)
+        {
+            best = bpm;
+            bestDistance = distance;
+        }
+    }
+
+    return std::round (best * 100.0) / 100.0;
+}
+
+double PadSlicerAudioProcessor::detectLoopBpm() const
+{
+    int length = 0;
+    double rate = 0.0;
+
+    {
+        const juce::ScopedLock lock (infoLock);
+        length = uiSliceLength;
+        rate = uiSliceRate;
+    }
+
+    return length > 0 && rate > 0.0 ? estimateBpm (length / rate) : 0.0;
 }
 
 void PadSlicerAudioProcessor::clearSample (int slot)
@@ -938,23 +1262,59 @@ PadSlicerAudioProcessor::SlotInfo PadSlicerAudioProcessor::getSlotInfo (int slot
 PadSlicerAudioProcessor::SliceLayout PadSlicerAudioProcessor::getSliceLayout() const
 {
     SliceLayout layout;
-    std::vector<int> hits;
+    std::vector<int> hits, manual;
 
     {
         const juce::ScopedLock lock (infoLock);
         hits = uiHits;
+        manual = slotInfos[(size_t) sliceSlot].manualStarts;
         layout.length = uiSliceLength;
         layout.sampleRate = uiSliceRate;
     }
 
     const auto sliceBy = getSliceBy();
     const int gridSlices = (int) slicesParam->load();
-    const int count = sliceCount (layout.length, sliceBy, gridSlices, hits);
+    const int count = sliceCount (layout.length, sliceBy, gridSlices, hits, manual);
 
     for (int i = 0; i < count; ++i)
-        layout.slices.push_back (sliceRegion (i, layout.length, sliceBy, gridSlices, hits));
+        layout.slices.push_back (sliceRegion (i, layout.length, sliceBy, gridSlices, hits, manual));
 
     return layout;
+}
+
+void PadSlicerAudioProcessor::setManualSlices (std::vector<int> starts)
+{
+    int length = 0;
+
+    {
+        const juce::ScopedLock lock (infoLock);
+        length = uiSliceLength;
+    }
+
+    // Keep the lines in order, inside the loop, and not on top of each other
+    std::sort (starts.begin(), starts.end());
+    std::vector<int> cleaned;
+
+    for (const int start : starts)
+        if (start >= 0 && start < length && (cleaned.empty() || start - cleaned.back() >= 16) && (int) cleaned.size() < maxSlices)
+            cleaned.push_back (start);
+
+    {
+        const juce::ScopedLock lock (infoLock);
+        slotInfos[(size_t) sliceSlot].manualStarts = cleaned;
+    }
+
+    // Hand the new lines to the audio thread; the old list is freed here, not there
+    {
+        const juce::SpinLock::ScopedLockType lock (sampleLock);
+
+        if (auto* loop = samples[(size_t) sliceSlot].get())
+            loop->manual.swap (cleaned);
+    }
+
+    if (getSliceBy() != SliceBy::manual)
+        if (auto* parameter = apvts.getParameter (sliceById))
+            parameter->setValueNotifyingHost (parameter->convertTo0to1 ((float) SliceBy::manual));
 }
 
 void PadSlicerAudioProcessor::sendSlicesToPads (const juce::Array<int>& slices, std::function<void (int)> onDone)
@@ -967,6 +1327,7 @@ void PadSlicerAudioProcessor::sendSlicesToPads (const juce::Array<int>& slices, 
         int pad;
         juce::Range<int> region;
         juce::uint32 generation;
+        double bpm;
     };
 
     std::vector<Transfer> transfers;
@@ -991,6 +1352,7 @@ void PadSlicerAudioProcessor::sendSlicesToPads (const juce::Array<int>& slices, 
         info.file = source.file;
         info.region = { source.region.getStart() + region.getStart(), source.region.getStart() + region.getEnd() };
         info.chopNumber = slice + 1;
+        info.sourceBpm = loopBpmParam->load();
 
         {
             const juce::ScopedLock lock (infoLock);
@@ -1001,7 +1363,7 @@ void PadSlicerAudioProcessor::sendSlicesToPads (const juce::Array<int>& slices, 
         for (int c = 0; c < numSlotControls; ++c)
             setSetting (padSettings (pad), (SlotControl) c, getSetting (sliceSettings (slice), (SlotControl) c));
 
-        transfers.push_back ({ pad, region, generation });
+        transfers.push_back ({ pad, region, generation, info.sourceBpm });
         ++pad;
     }
 
@@ -1027,6 +1389,12 @@ void PadSlicerAudioProcessor::sendSlicesToPads (const juce::Array<int>& slices, 
 
                 for (int ch = 0; ch < loop->buffer.getNumChannels(); ++ch)
                     chop->buffer.copyFrom (ch, 0, loop->buffer, ch, transfer.region.getStart(), transfer.region.getLength());
+
+                chop->sourceBpm = transfer.bpm;
+
+                for (const int hit : loop->hits)
+                    if (hit > transfer.region.getStart() && hit < transfer.region.getEnd())
+                        chop->hits.push_back (hit - transfer.region.getStart());
             }
 
             if (chop != nullptr && swapSample (transfer.pad, chop, transfer.generation))
@@ -1113,6 +1481,19 @@ void PadSlicerAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
         slotTree.setProperty ("start", info.region.getStart(), nullptr);
         slotTree.setProperty ("end", info.region.getEnd(), nullptr);
         slotTree.setProperty ("chop", info.chopNumber, nullptr);
+
+        if (info.sourceBpm > 0.0)
+            slotTree.setProperty ("bpm", info.sourceBpm, nullptr);
+
+        if (! info.manualStarts.empty())
+        {
+            juce::StringArray lines;
+
+            for (const int start : info.manualStarts)
+                lines.add (juce::String (start));
+
+            slotTree.setProperty ("manual", lines.joinIntoString (","), nullptr);
+        }
         slotsTree.appendChild (slotTree, nullptr);
     }
 
@@ -1147,6 +1528,24 @@ void PadSlicerAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     for (int c = 0; c < Generator::numControls; ++c)
         generatorTree.setProperty (juce::String ("c") + juce::String (c), generatorSettings.values[(size_t) c], nullptr);
 
+    for (const auto& note : generatorSettings.added)
+    {
+        juce::ValueTree added ("ADD");
+        added.setProperty ("start", note.start, nullptr);
+        added.setProperty ("length", note.length, nullptr);
+        added.setProperty ("note", note.note, nullptr);
+        added.setProperty ("velocity", note.velocity, nullptr);
+        generatorTree.appendChild (added, nullptr);
+    }
+
+    for (const auto& key : generatorSettings.removed)
+    {
+        juce::ValueTree removed ("DEL");
+        removed.setProperty ("start", key.start, nullptr);
+        removed.setProperty ("note", key.note, nullptr);
+        generatorTree.appendChild (removed, nullptr);
+    }
+
     state.appendChild (generatorTree, nullptr);
 
     if (auto xml = state.createXml())
@@ -1176,6 +1575,10 @@ void PadSlicerAudioProcessor::setStateInformation (const void* data, int sizeInB
             info.file = juce::File (slotTree.getProperty ("path").toString());
             info.region = { (juce::int64) slotTree.getProperty ("start", 0), (juce::int64) slotTree.getProperty ("end", 0) };
             info.chopNumber = slotTree.getProperty ("chop", 0);
+            info.sourceBpm = slotTree.getProperty ("bpm", 0.0);
+
+            for (const auto& line : juce::StringArray::fromTokens (slotTree.getProperty ("manual").toString(), ",", {}))
+                info.manualStarts.push_back (line.getIntValue());
         }
     }
     else
@@ -1220,6 +1623,15 @@ void PadSlicerAudioProcessor::setStateInformation (const void* data, int sizeInB
         for (int c = 0; c < Generator::numControls; ++c)
             generatorSettings.values[(size_t) c] = (float) generatorTree.getProperty (juce::String ("c") + juce::String (c),
                                                                                        Generator::getControlInfo (c).defaultValue);
+
+        for (const auto& edit : generatorTree)
+        {
+            if (edit.hasType ("ADD"))
+                generatorSettings.added.push_back ({ (double) edit.getProperty ("start"), (double) edit.getProperty ("length"),
+                                                     (int) edit.getProperty ("note"), (float) edit.getProperty ("velocity", 0.8f) });
+            else if (edit.hasType ("DEL"))
+                generatorSettings.removed.push_back ({ (double) edit.getProperty ("start"), (int) edit.getProperty ("note") });
+        }
     }
 
     // Keep only the parameters in the APVTS state

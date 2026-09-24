@@ -22,15 +22,34 @@ namespace Generator
     const ControlInfo& getControlInfo (int control);
     juce::String getValueText (int control, float value);
 
+    struct Note
+    {
+        double start, length;   // in beats
+        int note;
+        float velocity;
+    };
+
+    // Identifies a generated note that was erased by hand
+    struct EditKey
+    {
+        double start;
+        int note;
+    };
+
     struct Settings
     {
         Settings();
 
         std::array<float, numControls> values;
-        juce::int64 seed = 0;   // 0 = nothing generated yet
+        juce::int64 seed = 0;   // 0 = nothing generated (the pattern is only what was drawn by hand)
+
+        // Hand edits, kept on top of the generated notes when knobs are turned
+        std::vector<Note> added;
+        std::vector<EditKey> removed;
 
         int getInt (Control c) const   { return juce::roundToInt (values[(size_t) c]); }
         float getAmount (Control c) const { return values[(size_t) c] / 100.0f; }   // percentage controls as 0..1
+        bool hasEdits() const          { return ! added.empty() || ! removed.empty(); }
     };
 
     // Something the pattern can play: a slice or a pad
@@ -40,12 +59,13 @@ namespace Generator
         double position;   // where it sits in the loop, 0..1 (used by ORDER)
     };
 
-    struct Note
-    {
-        double start, length;   // in beats
-        int note;
-        float velocity;
-    };
+    // The step grid, for drawing notes by hand
+    double getBarsChoiceBeats (int barsIndex);   // length of each BARS choice
+    double getPatternBeats (const Settings&);
+    double getStepBeats (const Settings&);
+    double getStepStart (const Settings&, int step);   // includes swing
+    double getDrawnNoteBeats (const Settings&);        // length of a note drawn by hand
+    bool isSameNote (const Note&, const EditKey&);
 
     struct Pattern
     {

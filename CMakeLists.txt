@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0")
 
-project(PADSLICER VERSION 0.2.0)
+project(PADSLICER VERSION 0.3.0)
 
 # Pull JUCE in at configure time. To use a local checkout instead, configure with
 # -DFETCHCONTENT_SOURCE_DIR_JUCE=/path/to/JUCE
@@ -23,7 +23,7 @@ juce_add_plugin(PadSlicer
     NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
-    EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+    EDITOR_WANTS_KEYBOARD_FOCUS TRUE            # The pattern editor uses Ableton-style key commands
     COPY_PLUGIN_AFTER_BUILD TRUE                # Installs to ~/Library/Audio/Plug-Ins so Ableton finds it
     PLUGIN_MANUFACTURER_CODE Orri               # Four chars, at least one upper-case. Keep it: hosts use it to find the plugin in saved sets
     PLUGIN_CODE Pslc                            # Four chars, exactly one upper-case
@@ -40,7 +40,8 @@ target_sources(PadSlicer
         Knight.cpp
         Effects.cpp
         Transients.cpp
-        Generator.cpp)
+        Generator.cpp
+        PatternEditor.cpp)
 
 target_compile_definitions(PadSlicer
     PUBLIC

@@ -447,10 +447,31 @@ void MidiDragButton::mouseUp (const juce::MouseEvent&)
 
 //==============================================================================
 GenPanel::GenPanel (Processor& p)
-    : processorRef (p)
+    : processorRef (p),
+      editor (p)
 {
+    // The piano roll edits the pattern shown here
+    editor.pattern = &pattern;
+    editor.getSourceNotes = [this]
+    {
+        double loopBeats = 4.0;
+        std::vector<int> notes;
+
+        for (const auto& source : collectSources (loopBeats))
+            notes.push_back (source.note);
+
+        return notes;
+    };
+    editor.onEdited = [this] { regenerate(); };
+    editor.onStatus = [this] (const juce::String& message) { if (onStatus != nullptr) onStatus (message); };
+    editor.onImport = [this] { chooseMidiFile(); };
+    editor.onClose = [this] { setEditing (false); };
+    addChildComponent (editor);
+
     generateChip.onClick = [this] { generateNew(); };
     saveChip.onClick = [this] { saveMidiFile(); };
+    editChip.onClick = [this] { setEditing (! editing); };
+    importChip.onClick = [this] { chooseMidiFile(); };
 
     playChip.onClick = [this]
     {
@@ -475,7 +496,7 @@ GenPanel::GenPanel (Processor& p)
         return file;
     };
 
-    for (juce::Component* child : std::initializer_list<juce::Component*> { &generateChip, &playChip, &saveChip, &dragButton })
+    for (juce::Component* child : std::initializer_list<juce::Component*> { &generateChip, &playChip, &saveChip, &editChip, &importChip, &dragButton })
         addAndMakeVisible (child);
 
     for (int c = 0; c < Generator::numControls; ++c)
@@ -525,9 +546,14 @@ void GenPanel::resized()
     top.removeFromLeft (6);
     dragButton.setBounds (top.removeFromLeft (156));
     top.removeFromLeft (6);
-    saveChip.setBounds (top.removeFromLeft (60));
+    saveChip.setBounds (top.removeFromLeft (56));
+    top.removeFromLeft (6);
+    editChip.setBounds (top.removeFromLeft (56));
+    top.removeFromLeft (6);
+    importChip.setBounds (top.removeFromLeft (80));
 
     area.removeFromTop (6);
+    editor.setBounds (area);
     patternArea = area.removeFromLeft (236);
     area.removeFromLeft (8);
 
@@ -545,16 +571,37 @@ void GenPanel::resized()
     }
 }
 
+void GenPanel::paintOverChildren (juce::Graphics& g)
+{
+    if (! dropHover)
+        return;
+
+    // A MIDI file is being dragged over the page
+    const auto area = getLocalBounds().toFloat().withTrimmedTop (26.0f);
+    g.setColour (Palette::lcdBackground.withAlpha (0.85f));
+    g.fillRect (area);
+    g.setColour (Palette::lcdBright);
+
+    for (float x = area.getX(); x < area.getRight(); x += 6.0f)
+    {
+        g.fillRect (x, area.getY(), 3.0f, 2.0f);
+        g.fillRect (x, area.getBottom() - 2.0f, 3.0f, 2.0f);
+    }
+
+    for (float y = area.getY(); y < area.getBottom(); y += 6.0f)
+    {
+        g.fillRect (area.getX(), y, 2.0f, 3.0f);
+        g.fillRect (area.getRight() - 2.0f, y, 2.0f, 3.0f);
+    }
+
+    drawPixelText (g, "DROP MIDI HERE", area, 3, Palette::lcdBright);
+}
+
 void GenPanel::paint (juce::Graphics& g)
 {
-    const auto info = pattern.notes.empty()
-                        ? juce::String()
-                        : Generator::getValueText (Generator::bars, processorRef.generatorSettings.values[Generator::bars])
-                              + "  " + juce::String ((int) pattern.notes.size()) + " NOTES";
-
-    drawPixelText (g, info, juce::Rectangle<float> ((float) saveChip.getRight() + 8.0f, 0.0f,
-                                                    (float) (getWidth() - saveChip.getRight() - 8), 20.0f),
-                   1, Palette::lcdMid, juce::Justification::centredRight);
+    // In edit mode the piano roll draws itself
+    if (editing)
+        return;
 
     // Pattern view: one row per slice or pad used, lowest at the bottom
     const auto area = patternArea.toFloat();
@@ -563,9 +610,12 @@ void GenPanel::paint (juce::Graphics& g)
 
     if (pattern.notes.empty())
     {
-        drawPixelText (g, sourcesKey.endsWith (":") ? "LOAD A LOOP OR PADS" : "PRESS GENERATE", area.reduced (6.0f), 1, Palette::lcdMid);
+        drawPixelText (g, sourcesKey.endsWith (":") ? "LOAD A LOOP OR PADS" : "GENERATE, DRAW OR DROP MIDI", area.reduced (6.0f), 1, Palette::lcdMid);
         return;
     }
+
+    drawPixelText (g, juce::String ((int) pattern.notes.size()) + " NOTES", area.reduced (5.0f).withHeight (8.0f), 1,
+                   Palette::lcdMid, juce::Justification::centredRight);
 
     const auto inner = area.reduced (3.0f);
     const double length = pattern.lengthBeats;
@@ -671,7 +721,18 @@ void GenPanel::update()
         regenerate();
     }
 
-    // The settings can also change from outside (loading a set)
+    syncKnobs();
+
+    const bool playing = processorRef.previewOn.load();
+    playChip.setButtonText (playing ? "STOP" : "PLAY");
+    playChip.setToggleState (playing, juce::dontSendNotification);
+    dragButton.setEnabled (! pattern.notes.empty());
+    saveChip.setEnabled (! pattern.notes.empty());
+}
+
+void GenPanel::syncKnobs()
+{
+    // The settings can also change from outside the knobs (loading a set, importing MIDI)
     for (int c = 0; c < Generator::numControls; ++c)
     {
         auto& slider = knobs[(size_t) c].slider;
@@ -680,12 +741,6 @@ void GenPanel::update()
         if (! slider.isMouseButtonDown() && ! juce::approximatelyEqual ((float) slider.getValue(), value))
             slider.setValue (value, juce::dontSendNotification);
     }
-
-    const bool playing = processorRef.previewOn.load();
-    playChip.setButtonText (playing ? "STOP" : "PLAY");
-    playChip.setToggleState (playing, juce::dontSendNotification);
-    dragButton.setEnabled (! pattern.notes.empty());
-    saveChip.setEnabled (! pattern.notes.empty());
 }
 
 void GenPanel::generateNew()
@@ -700,7 +755,13 @@ void GenPanel::generateNew()
         return;
     }
 
-    processorRef.generatorSettings.seed = juce::Random::getSystemRandom().nextInt64() | 1;
+    // A new pattern starts without the old hand edits (Cmd+Z in the editor brings the old one back)
+    editor.pushUndoState();
+    editor.clearSelection();
+    auto& settings = processorRef.generatorSettings;
+    settings.seed = juce::Random::getSystemRandom().nextInt64() | 1;
+    settings.added.clear();
+    settings.removed.clear();
     regenerate();
 
     if (onStatus != nullptr)
@@ -721,10 +782,218 @@ void GenPanel::regenerate()
     repaint();
 }
 
+//==============================================================================
+namespace
+{
+    bool isMidiFile (const juce::String& path)
+    {
+        return juce::File (path).hasFileExtension ("mid;midi;smf");
+    }
+}
+
+bool GenPanel::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    return std::any_of (files.begin(), files.end(), isMidiFile);
+}
+
+void GenPanel::fileDragEnter (const juce::StringArray&, int, int)
+{
+    dropHover = true;
+    repaint();
+}
+
+void GenPanel::fileDragExit (const juce::StringArray&)
+{
+    dropHover = false;
+    repaint();
+}
+
+void GenPanel::filesDropped (const juce::StringArray& files, int, int)
+{
+    dropHover = false;
+
+    for (const auto& path : files)
+    {
+        if (isMidiFile (path))
+        {
+            importMidiFile (juce::File (path));
+            return;
+        }
+    }
+
+    repaint();
+}
+
+void GenPanel::chooseMidiFile()
+{
+    chooser = std::make_unique<juce::FileChooser> ("Import a MIDI file",
+                                                   juce::File::getSpecialLocation (juce::File::userHomeDirectory),
+                                                   "*.mid;*.midi");
+
+    juce::Component::SafePointer<GenPanel> safeThis (this);
+
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                          [safeThis] (const juce::FileChooser& fc)
+                          {
+                              if (safeThis != nullptr && fc.getResult() != juce::File())
+                                  safeThis->importMidiFile (fc.getResult());
+                          });
+}
+
+void GenPanel::importMidiFile (const juce::File& file)
+{
+    auto status = [this] (const juce::String& message)
+    {
+        if (onStatus != nullptr)
+            onStatus (message);
+    };
+
+    juce::FileInputStream in (file);
+    juce::MidiFile midi;
+
+    // Only files timed in beats (ticks per quarter note) can be placed on the grid
+    if (! in.openedOk() || ! midi.readFrom (in) || midi.getTimeFormat() <= 0)
+    {
+        status ("CAN'T READ " + file.getFileName());
+        return;
+    }
+
+    const double ticksPerBeat = midi.getTimeFormat();
+    std::vector<Generator::Note> notes;
+
+    for (int t = 0; t < midi.getNumTracks(); ++t)
+    {
+        juce::MidiMessageSequence track (*midi.getTrack (t));
+        track.updateMatchedPairs();
+
+        for (const auto* event : track)
+        {
+            if (! event->message.isNoteOn())
+                continue;
+
+            const double start = event->message.getTimeStamp() / ticksPerBeat;
+            const double end = event->noteOffObject != nullptr ? event->noteOffObject->message.getTimeStamp() / ticksPerBeat
+                                                               : start + 0.25;
+
+            notes.push_back ({ start, juce::jmax (0.01, end - start), event->message.getNoteNumber(), event->message.getFloatVelocity() });
+        }
+    }
+
+    if (notes.empty())
+    {
+        status ("NO NOTES IN " + file.getFileName());
+        return;
+    }
+
+    // The clip becomes 1, 2, 4 or 8 bars, whichever fits; anything after 8 bars is left out
+    double lastEnd = 0.0;
+
+    for (const auto& note : notes)
+        lastEnd = juce::jmax (lastEnd, note.start + note.length);
+
+    int barsIndex = 3;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        if (lastEnd <= Generator::getBarsChoiceBeats (i) + 1.0e-6)
+        {
+            barsIndex = i;
+            break;
+        }
+    }
+
+    const double clipBeats = Generator::getBarsChoiceBeats (barsIndex);
+    const auto countBefore = notes.size();
+    notes.erase (std::remove_if (notes.begin(), notes.end(), [clipBeats] (const Generator::Note& n) { return n.start >= clipBeats; }),
+                 notes.end());
+    const bool cut = notes.size() < countBefore;
+
+    // Notes that already land on the slices or pads stay put; otherwise each pitch goes to one, lowest to lowest
+    double loopBeats = 4.0;
+    std::vector<int> playable;
+
+    for (const auto& source : collectSources (loopBeats))
+        playable.push_back (source.note);
+
+    std::sort (playable.begin(), playable.end());
+
+    const bool allPlayable = std::all_of (notes.begin(), notes.end(), [&playable] (const Generator::Note& n)
+    {
+        return std::binary_search (playable.begin(), playable.end(), n.note);
+    });
+
+    const bool remap = ! allPlayable && ! playable.empty();
+
+    if (remap)
+    {
+        std::vector<int> pitches;
+
+        for (const auto& note : notes)
+            pitches.push_back (note.note);
+
+        std::sort (pitches.begin(), pitches.end());
+        pitches.erase (std::unique (pitches.begin(), pitches.end()), pitches.end());
+
+        for (auto& note : notes)
+        {
+            const auto index = (size_t) (std::lower_bound (pitches.begin(), pitches.end(), note.note) - pitches.begin());
+            note.note = playable[index % playable.size()];
+        }
+    }
+
+    // The imported notes become the pattern, ready to edit
+    editor.pushUndoState();
+    editor.clearSelection();
+    auto& settings = processorRef.generatorSettings;
+    settings.seed = 0;
+    settings.removed.clear();
+    settings.added = notes;
+    settings.values[Generator::bars] = (float) barsIndex;
+
+    syncKnobs();
+    regenerate();
+    setEditing (true);
+
+    status ("IMPORTED " + juce::String ((int) notes.size()) + " NOTES"
+            + (cut ? juce::String (" (FIRST 8 BARS)") : juce::String())
+            + (remap ? juce::String (" ONTO YOUR ") + (processorRef.getMode() == Processor::Mode::kit ? "PADS" : "SLICES") : juce::String()));
+}
+
+//==============================================================================
+void GenPanel::setEditing (bool shouldEdit)
+{
+    editing = shouldEdit;
+    editChip.setToggleState (editing, juce::dontSendNotification);
+    editor.setVisible (editing);
+
+    for (auto& knob : knobs)
+    {
+        knob.slider.setVisible (! editing);
+        knob.label.setVisible (! editing);
+    }
+
+    if (editing)
+    {
+        editor.grabKeyboardFocus();
+
+        if (onStatus != nullptr)
+            onStatus ("DRAG = SELECT, B = DRAW MODE");
+    }
+
+    repaint();
+}
+
+void GenPanel::mouseDown (const juce::MouseEvent& e)
+{
+    // Clicking the little pattern opens the editor
+    if (! editing && patternArea.contains (e.getPosition()))
+        setEditing (true);
+}
+
 juce::String GenPanel::getClipName() const
 {
     const auto id = juce::String::toHexString (processorRef.generatorSettings.seed).getLastCharacters (4).toUpperCase();
-    return "PadSlicer " + id;
+    return "PadSlicer " + (id.isEmpty() || processorRef.generatorSettings.seed == 0 ? juce::String ("Pattern") : id);
 }
 
 juce::File GenPanel::writeMidiFile (const juce::File& file) const
@@ -770,9 +1039,105 @@ void GenPanel::saveMidiFile()
 }
 
 //==============================================================================
+BpmField::BpmField (juce::RangedAudioParameter& p, std::function<double()> detect)
+    : detectBpm (std::move (detect)),
+      attachment (p, [this] (float newValue) { value = newValue; repaint(); })
+{
+    attachment.sendInitialUpdate();
+    setMouseCursor (juce::MouseCursor::UpDownResizeCursor);
+}
+
+void BpmField::paint (juce::Graphics& g)
+{
+    const auto bounds = getLocalBounds().toFloat();
+    const auto colour = isEnabled() ? (dragging || isMouseOver() ? Palette::lcdBright : Palette::lcdMid) : Palette::lcdDim;
+
+    g.setColour (colour);
+    g.drawRect (bounds, 1.0f);
+
+    const auto text = std::abs (value - std::round (value)) < 0.005f ? juce::String (juce::roundToInt (value))
+                                                                     : juce::String (value, 2);
+    drawPixelText (g, text + " BPM", bounds.reduced (3.0f, 0.0f), 1, isEnabled() ? Palette::lcdBright : Palette::lcdDim);
+}
+
+void BpmField::setBpm (double bpm)
+{
+    attachment.setValueAsCompleteGesture ((float) juce::jlimit (40.0, 300.0, bpm));
+}
+
+void BpmField::mouseDown (const juce::MouseEvent& e)
+{
+    if (e.mods.isPopupMenu())
+    {
+        showMenu();
+        return;
+    }
+
+    dragging = true;
+    dragStartValue = value;
+    attachment.beginGesture();
+}
+
+void BpmField::mouseDrag (const juce::MouseEvent& e)
+{
+    if (! dragging)
+        return;
+
+    // Up is faster; Shift drags in hundredths
+    const float step = e.mods.isShiftDown() ? 0.01f : 0.5f;
+    const float newValue = juce::jlimit (40.0f, 300.0f, dragStartValue - (float) e.getDistanceFromDragStartY() * step);
+    attachment.setValueAsPartOfGesture (std::round (newValue * 100.0f) / 100.0f);
+}
+
+void BpmField::mouseUp (const juce::MouseEvent&)
+{
+    if (dragging)
+        attachment.endGesture();
+
+    dragging = false;
+    repaint();
+}
+
+void BpmField::mouseDoubleClick (const juce::MouseEvent&)
+{
+    if (const double detected = detectBpm != nullptr ? detectBpm() : 0.0; detected > 0.0)
+    {
+        setBpm (detected);
+
+        if (onStatus != nullptr)
+            onStatus ("LOOP TEMPO: " + juce::String (detected, 2) + " BPM");
+    }
+}
+
+void BpmField::showMenu()
+{
+    juce::PopupMenu menu;
+    menu.addItem (1, "Double (x2)");
+    menu.addItem (2, "Half");
+    menu.addItem (3, "Detect From Loop Length");
+
+    juce::Component::SafePointer<BpmField> safeThis (this);
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withMousePosition(), [safeThis] (int result)
+    {
+        if (safeThis == nullptr)
+            return;
+
+        if (result == 1)
+            safeThis->setBpm (safeThis->value * 2.0);
+        else if (result == 2)
+            safeThis->setBpm (safeThis->value * 0.5);
+        else if (result == 3)
+            safeThis->mouseDoubleClick ({ juce::Desktop::getInstance().getMainMouseSource(), {}, {}, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                          safeThis.getComponent(), safeThis.getComponent(), juce::Time(), {}, juce::Time(), 2, false });
+    });
+}
+
+//==============================================================================
 PadSlicerUI::PadSlicerUI (Processor& p)
     : processorRef (p),
       thumbnail (16, p.getFormatManager(), thumbnailCache),
+      bpmField (*p.apvts.getParameter (Processor::loopBpmId), [&p] { return p.detectLoopBpm(); }),
       padGrid (p),
       fxPanel (p.apvts),
       genPanel (p)
@@ -789,6 +1154,27 @@ PadSlicerUI::PadSlicerUI (Processor& p)
     genTab.onClick        = [this] { setPage (Page::gen); };
     gridChip.onClick      = [this] { setChoice (processorRef, Processor::sliceById, 0); };
     hitsChip.onClick      = [this] { setChoice (processorRef, Processor::sliceById, 1); };
+
+    // EDIT keeps the current slice lines and lets you drag them
+    manualChip.onClick = [this]
+    {
+        std::vector<int> lines;
+
+        for (const auto& slice : processorRef.getSliceLayout().slices)
+            lines.push_back (slice.getStart());
+
+        if (! lines.empty())
+        {
+            processorRef.setManualSlices (lines);
+            setStatus ("DRAG THE SLICE LINES TO MOVE THEM");
+        }
+    };
+    // Tempo sync switch and the loop's BPM
+    syncChip.setClickingTogglesState (true);
+    syncAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (processorRef.apvts, Processor::syncId, syncChip);
+    bpmField.onStatus = [this] (const juce::String& message) { setStatus (message); };
+    addAndMakeVisible (bpmField);
+
     zoomOutChip.onClick   = [this] { zoomAround ((viewStart + viewEnd) * 0.5, 0.5); };
     zoomInChip.onClick    = [this] { zoomAround ((viewStart + viewEnd) * 0.5, 2.0); };
     zoomAllChip.onClick   = [this] { showWholeLoop(); };
@@ -797,7 +1183,7 @@ PadSlicerUI::PadSlicerUI (Processor& p)
     sizeChip.onClick      = [this] { showSizeMenu(); };
 
     for (juce::Button* button : std::initializer_list<juce::Button*> { &transferButton, &loadButton, &triggerButton,
-                                                                       &slicerTab, &padsTab, &fxTab, &genTab, &gridChip, &hitsChip,
+                                                                       &slicerTab, &padsTab, &fxTab, &genTab, &gridChip, &hitsChip, &manualChip, &syncChip,
                                                                        &zoomOutChip, &zoomInChip, &zoomAllChip,
                                                                        &slotChip, &masterChip, &sizeChip })
         addAndMakeVisible (button);
@@ -885,11 +1271,16 @@ void PadSlicerUI::resized()
     const auto header = lcdArea.reduced (10).withHeight (16);
     gridChip.setBounds (header.getX() + 82, header.getY() + 1, 34, 14);
     hitsChip.setBounds (gridChip.getRight() + 4, gridChip.getY(), 34, 14);
+    manualChip.setBounds (hitsChip.getRight() + 4, gridChip.getY(), 34, 14);
 
     // Zoom buttons just left of TRIG/GATE
     zoomAllChip.setBounds (header.getRight() - 56 - 30, gridChip.getY(), 30, 14);
     zoomInChip.setBounds (zoomAllChip.getX() - 20, gridChip.getY(), 16, 14);
     zoomOutChip.setBounds (zoomInChip.getX() - 20, gridChip.getY(), 16, 14);
+
+    // Tempo sync and the loop's BPM, left of the zoom buttons
+    bpmField.setBounds (zoomOutChip.getX() - 8 - 58, gridChip.getY(), 58, 14);
+    syncChip.setBounds (bpmField.getX() - 4 - 34, gridChip.getY(), 34, 14);
 
     meterArea = knobRow.removeFromRight (64);
     knobRow.removeFromRight (12);
@@ -1162,7 +1553,7 @@ void PadSlicerUI::drawLcd (juce::Graphics& g)
     else
     {
         centreText = shownFile == juce::File() ? juce::String ("NO SAMPLE") : shownFile.getFileName();
-        centreArea = header.withTrimmedLeft (170.0f).withTrimmedRight (144.0f);
+        centreArea = header.withTrimmedLeft (200.0f).withTrimmedRight (250.0f);
     }
 
     drawPixelText (g, centreText, centreArea, 2, Palette::lcdMid);
@@ -1194,6 +1585,24 @@ void PadSlicerUI::drawLcd (juce::Graphics& g)
 juce::Rectangle<float> PadSlicerUI::waveformArea() const
 {
     return lcdContentArea.toFloat().withTrimmedTop (12.0f).withTrimmedBottom (18.0f);
+}
+
+int PadSlicerUI::lineAt (juce::Point<float> position, const Processor::SliceLayout& layout) const
+{
+    const auto wave = waveformArea();
+
+    if (page != Page::slicer || layout.length <= 0 || ! wave.withTop (wave.getY() - 12.0f).contains (position))
+        return -1;
+
+    for (size_t i = 0; i < layout.slices.size(); ++i)
+    {
+        const int start = layout.slices[i].getStart();
+
+        if (start > 0 && std::abs (position.x - xForPosition ((double) start / layout.length)) <= 4.0f)
+            return (int) i;
+    }
+
+    return -1;
 }
 
 juce::Rectangle<float> PadSlicerUI::overviewArea() const
@@ -1387,10 +1796,14 @@ void PadSlicerUI::drawWaveform (juce::Graphics& g, juce::Rectangle<float> area)
 
         if (region.getStart() > 0)
         {
-            g.setColour (Palette::lcdMid.withAlpha (0.7f));
+            // Slice lines can be dragged; the small handle at the top shows it
+            const bool active = i == draggingLine || i == hoverLine;
+            g.setColour (active ? Palette::lcdBright : Palette::lcdMid.withAlpha (0.7f));
 
-            for (float y = labelRow.getY(); y < strip.getY() - 2.0f; y += 6.0f)
+            for (float y = labelRow.getY(); y < strip.getY() - 2.0f; y += active ? 3.0f : 6.0f)
                 g.fillRect (x, y, 2.0f, 3.0f);
+
+            g.fillRect (juce::Rectangle<float> (x - 2.0f, labelRow.getY(), 6.0f, 5.0f));
         }
 
         if (width >= 26.0f)
@@ -1606,9 +2019,15 @@ void PadSlicerUI::updatePage()
     fxTab.setToggleState (page == Page::fx, juce::dontSendNotification);
     genTab.setToggleState (page == Page::gen, juce::dontSendNotification);
 
-    const bool byHits = processorRef.getSliceBy() == Processor::SliceBy::hits;
+    const auto sliceBy = processorRef.getSliceBy();
+    const bool byHits = sliceBy == Processor::SliceBy::hits;
     gridChip.setVisible (page == Page::slicer);
     hitsChip.setVisible (page == Page::slicer);
+    manualChip.setVisible (page == Page::slicer);
+    syncChip.setVisible (page == Page::slicer);
+    bpmField.setVisible (page == Page::slicer);
+    bpmField.setEnabled (syncChip.getToggleState());
+    manualChip.setToggleState (sliceBy == Processor::SliceBy::manual, juce::dontSendNotification);
     for (auto* chip : { &zoomOutChip, &zoomInChip, &zoomAllChip })
     {
         chip->setVisible (page == Page::slicer);
@@ -1616,13 +2035,13 @@ void PadSlicerUI::updatePage()
     }
 
     zoomAllChip.setToggleState (viewEnd - viewStart < 0.999, juce::dontSendNotification);
-    gridChip.setToggleState (! byHits, juce::dontSendNotification);
+    gridChip.setToggleState (sliceBy == Processor::SliceBy::grid, juce::dontSendNotification);
     hitsChip.setToggleState (byHits, juce::dontSendNotification);
 
-    // Slice count and hit sensitivity only matter in Slice mode
-    const bool kit = processorRef.getMode() == Processor::Mode::kit;
-    knobs[0].slider.setEnabled (! kit);
-    knobs[0].label.setEnabled (! kit);
+    // Slice count and hit sensitivity only matter in Slice mode, and not with hand-placed lines
+    const bool firstKnobUsed = processorRef.getMode() == Processor::Mode::slice && sliceBy != Processor::SliceBy::manual;
+    knobs[0].slider.setEnabled (firstKnobUsed);
+    knobs[0].label.setEnabled (firstKnobUsed);
 }
 
 void PadSlicerUI::setMode (Processor::Mode mode)
@@ -1758,6 +2177,32 @@ void PadSlicerUI::mouseDown (const juce::MouseEvent& e)
     }
 
     const auto layout = processorRef.getSliceLayout();
+
+    // Slice lines: drag to move, Option-click to remove
+    if (const int line = lineAt (e.position, layout); line >= 0)
+    {
+        std::vector<int> lines;
+
+        for (const auto& region : layout.slices)
+            lines.push_back (region.getStart());
+
+        if (e.mods.isAltDown())
+        {
+            if (lines.size() > 1)
+            {
+                lines.erase (lines.begin() + line);
+                processorRef.setManualSlices (lines);
+                setStatus ("REMOVED A SLICE LINE");
+            }
+
+            return;
+        }
+
+        dragLines = lines;
+        draggingLine = line;
+        return;
+    }
+
     const int slice = sliceAt (e.position.x, layout);
 
     if (slice < 0)
@@ -1790,6 +2235,25 @@ void PadSlicerUI::mouseDown (const juce::MouseEvent& e)
 
 void PadSlicerUI::mouseDrag (const juce::MouseEvent& e)
 {
+    if (draggingLine >= 0)
+    {
+        const auto layout = processorRef.getSliceLayout();
+        const auto line = (size_t) draggingLine;
+
+        if (layout.length <= 0 || line >= dragLines.size())
+            return;
+
+        // Stay between the neighbouring lines
+        constexpr int minimumGap = 32;
+        const int lower = line > 0 ? dragLines[line - 1] + minimumGap : 0;
+        const int upper = line + 1 < dragLines.size() ? dragLines[line + 1] - minimumGap : layout.length - minimumGap;
+
+        dragLines[line] = juce::jlimit (lower, juce::jmax (lower, upper), (int) (positionAt (e.position.x) * layout.length));
+        processorRef.setManualSlices (dragLines);
+        repaint (lcdArea);
+        return;
+    }
+
     if (! draggingOverview)
         return;
 
@@ -1826,9 +2290,54 @@ void PadSlicerUI::mouseMagnify (const juce::MouseEvent& e, float scaleFactor)
         zoomAround (positionAt (e.position.x), (double) scaleFactor);
 }
 
+void PadSlicerUI::mouseMove (const juce::MouseEvent& e)
+{
+    const int line = shownFile == juce::File() ? -1 : lineAt (e.position, processorRef.getSliceLayout());
+
+    if (line != hoverLine)
+    {
+        hoverLine = line;
+        setMouseCursor (line >= 0 ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+        repaint (lcdArea);
+    }
+}
+
+void PadSlicerUI::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    // Double-click the loop to add a slice line there
+    if (page != Page::slicer || shownFile == juce::File() || ! waveformArea().contains (e.position))
+        return;
+
+    const auto layout = processorRef.getSliceLayout();
+
+    if (layout.length <= 0 || lineAt (e.position, layout) >= 0)
+        return;
+
+    if ((int) layout.slices.size() >= Processor::maxSlices)
+    {
+        setStatus ("64 SLICES IS THE MAXIMUM");
+        return;
+    }
+
+    std::vector<int> lines;
+
+    for (const auto& region : layout.slices)
+        lines.push_back (region.getStart());
+
+    lines.push_back ((int) (positionAt (e.position.x) * layout.length));
+    processorRef.setManualSlices (lines);
+    setStatus ("ADDED A SLICE LINE");
+}
+
 void PadSlicerUI::mouseUp (const juce::MouseEvent&)
 {
     draggingOverview = false;
+
+    if (draggingLine >= 0)
+    {
+        setStatus ("MOVED SLICE LINE " + juce::String (draggingLine + 1));
+        draggingLine = -1;
+    }
 
     if (heldSliceNote >= 0)
         processorRef.keyboardState.noteOff (1, heldSliceNote, 0.0f);
